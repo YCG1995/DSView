@@ -1270,6 +1270,11 @@ SR_API uint16_t ds_trigger_get_pos();
 SR_API int ds_trigger_set_en(uint16_t enable);
 SR_API uint16_t ds_trigger_get_en();
 SR_API int ds_trigger_set_mode(uint16_t mode);
+
+/* Wall time of the last completed frame, measured inside the driver from the
+ * first data packet of the capture to the moment the frame is complete (USB
+ * readout plus the tail of the capture window). 0 until a frame is measured. */
+SR_API double ds_last_frame_transfer_ms(void);
  
 /*--- log.c -----------------------------------------------------------------*/
 

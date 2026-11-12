@@ -66,6 +66,7 @@ signals:
     void sig_screenShot(); //post screen capture event message
     void sig_load_session(QString); //post load session event message
     void sig_store_session(QString); //post store session event message
+    void sig_reload_scripts(QString); //report the script reload result
 
 private slots:
     void on_actionLoad_triggered();
@@ -73,6 +74,7 @@ private slots:
     void on_actionDefault_triggered();
     void on_actionOpen_triggered();
     void on_actionCapture_triggered();
+    void on_actionReload_triggered();
 
 private:
     SigSession* _session;
@@ -87,6 +89,7 @@ private:
     QAction *_action_save;
     QAction *_action_export;
     QAction *_action_capture;
+    QAction *_action_reload;
 };
 
 } // namespace toolbars

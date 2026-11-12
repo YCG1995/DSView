@@ -23,7 +23,12 @@
 
 #include <libsigrok.h>
 #include <libsigrokdecode.h>
+#if defined(Q_OS_ANDROID)
+#include <glib.h>
+#endif
 #include <QDir>
+#include <QFile>
+#include <QStringList>
 #include <QCoreApplication>
 #include <QWidget>
 #include <string>
@@ -34,6 +39,9 @@
 #include "log.h"
 #include "utility/path.h"
 #include "utility/encoding.h"
+#if defined(Q_OS_ANDROID)
+#include "android/android_assets.h"
+#endif
 
 AppControl::AppControl()
 {
@@ -104,16 +112,62 @@ bool AppControl::Init()
     }
   
 #endif
-    
+
+#if defined(_WIN32) && !defined(DEBUG_INFO)
+    // Portable Python: the bundled Python DLL cannot locate its standard
+    // library on its own, so point it at the copy shipped next to the
+    // executable ("./lib/python3.*/").
+    {
+        QString appDir = QCoreApplication::applicationDirPath();
+        QDir libDir(appDir + "/lib");
+        if (libDir.exists()) {
+            QStringList entries = libDir.entryList(QStringList() << "python3*",
+                                                   QDir::Dirs | QDir::NoDotAndDotDot);
+            if (!entries.isEmpty()) {
+                QDir pyDir(libDir.absolutePath() + "/" + entries.first());
+                if (QFile::exists(pyDir.absolutePath() + "/os.py")) {
+                    const wchar_t *pyhome = reinterpret_cast<const wchar_t*>(appDir.utf16());
+                    srd_set_python_home(pyhome);
+                }
+            }
+        }
+    }
+#endif
+
+#if defined(Q_OS_ANDROID) && !defined(DSVIEW_ANDROID_NO_PYTHON)
+    // Android: CPython 的标准库和解码器脚本都打在 APK assets 里，
+    // 首次启动复制到私有目录（/data/data/<pkg>/files{,/python}）。
+    {
+        QString pyHome = android_extract_assets(GetAppDataDir());
+        dsv_info("android python home:\"%s\"", pyHome.toUtf8().constData());
+        /* 扩展模块（_struct/binascii 等）在 APK 的 lib/<abi> 里，
+         * 通过 PYTHONPATH 让 import 能找到它们。 */
+        QString libDir = android_native_lib_dir();
+        dsv_info("android native lib dir:\"%s\"", libDir.toUtf8().constData());
+        qputenv("PYTHONPATH", libDir.toUtf8());
+        qputenv("PYTHONHOME", pyHome.toUtf8());
+        /* 注意：Android 的 wchar_t 是 4 字节，不能用 QString::utf16()（那是
+         * 2 字节 UTF-16，Windows 才适用）。必须 toStdWString() 才能拿到
+         * 宽字符编码正确的 home，否则 Python 读到乱码路径后会初始化失败，
+         * 并直接 exit(1)（错误只写 stderr，logcat 里什么都看不到）。 */
+        std::wstring pyHomeW = pyHome.toStdWString();
+        srd_set_python_home(pyHomeW.c_str());
+    }
+#endif
+
     //the python script path of decoder
     char path[256] = {0};
     QString dir = GetDecodeScriptDir();   
     strcpy(path, dir.toUtf8().data());
 
     // Initialise libsigrokdecode
-    if (srd_init(path) != SRD_OK)
+    int srd_ret = srd_init(path);
+    if (srd_ret != SRD_OK)
     { 
         dsv_err("ERROR: libsigrokdecode init failed.");
+        qWarning("libsigrokdecode init failed (ret=%d, decoders=%s)", srd_ret, path);
+        qWarning("pythonhome=%s pythonpath=%s", qgetenv("PYTHONHOME").constData(),
+                 qgetenv("PYTHONPATH").constData());
         return false;
     }
 
@@ -121,8 +175,14 @@ bool AppControl::Init()
     if (srd_decoder_load_all() != SRD_OK)
     {
         dsv_err("ERROR: load the protocol decoders failed.");
+        qWarning("load the protocol decoders failed (%s)", path);
         return false;
     }
+#if defined(Q_OS_ANDROID)
+    // 诊断用：确认 Python 解码器真的被扫描并加载（DSVIEW_ANDROID_PYTHON）
+    qWarning("decoders loaded: %d (dir=%s)",
+             g_slist_length((GSList *)srd_decoder_list()), path);
+#endif
  
     return true;
 }

@@ -28,7 +28,9 @@
 #include <vector>
 #include <stdint.h> 
 #include <QString>
+#include <QMap>
 #include <thread>
+#include <atomic>
 #include <QDateTime>
 #include <list>
 
@@ -107,6 +109,19 @@ public:
 
     void clear();
 
+    // Auto-save occupancy: while true, this buffer must not be cleared
+    // or selected for the next capture, because a save thread is reading
+    // its snapshots.
+    inline bool is_saving() const {
+        return save_in_progress.load();
+    }
+    inline void mark_saving() {
+        save_in_progress.store(true);
+    }
+    inline void clear_saving() {
+        save_in_progress.store(false);
+    }
+
 public:
     uint64_t       _cur_snap_samplerate;
     uint64_t       _cur_samplelimits;
@@ -116,6 +131,7 @@ private:
     data::LogicSnapshot   logic;
     data::AnalogSnapshot  analog;
     data::DsoSnapshot     dso;
+    std::atomic<bool>     save_in_progress{false};
 };
 
 using namespace pv::data;
@@ -405,6 +421,7 @@ public:
     bool have_hardware_data();
     struct ds_device_base_info* get_device_list(int &out_count, int &actived_index);
     void add_msg_listener(IMessageListener *ln);
+    void remove_msg_listener(IMessageListener *ln);
     void broadcast_msg(int msg);    
     bool have_new_realtime_refresh(bool keep);
     view::DecodeTrace* get_decoder_trace(int index);
@@ -424,6 +441,13 @@ public:
     void clear_view_data();
     void set_trace_name(view::Trace *trace, QString name);
     void set_decoder_row_label(int index, QString label);
+
+    // --- Auto-save (repeat mode) ---
+    // Mark the current view buffer as occupied by a background save and
+    // return it. The caller must release it once the save thread ends.
+    SessionData* auto_save_claim_view();
+    void auto_save_release(SessionData *data);
+    int  auto_save_active_count() const;
 
     inline void set_decoder_pannel(IDecoderPannel *pannel){
         _decoder_pannel = pannel;
@@ -454,6 +478,13 @@ public:
     void apply_samplerate();
 
     void ProcessPowerEvent(bool bEnterSleep);
+
+    // Reload only the protocol decoder packages whose script files changed.
+    QString reload_decoder_scripts();
+
+    // Re-run the decode for the trace at index (or all traces when index < 0)
+    // after options or probes were changed programmatically.
+    void re_decode_trace(int index = -1);
 
     inline void set_capture_work_time(uint64_t tm){
         _capture_work_time = tm;
@@ -566,6 +597,7 @@ private:
 	std::vector<view::Signal*>      _signals; 
     std::vector<view::DecodeTrace*> _decode_traces;
     std::vector<view::DecodeTrace*> _decode_tasks;
+    QMap<QString, QDateTime> _script_baseline; // decoder package -> latest script mtime
     pv::data::DecoderModel          *_decoder_model;
     std::vector<view::SpectrumTrace*> _spectrum_traces;
     view::LissajousTrace            *_lissajous_trace;

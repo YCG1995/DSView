@@ -1901,10 +1901,21 @@ static void remove_sources(struct DSL_context *devc)
 {
     int i;
     sr_info("%s: remove fds from polling", __func__);
-    /* Remove fds from polling. */
-    for (i = 0; devc->usbfd[i] != -1; i++)
-        sr_source_remove(devc->usbfd[i]);
-    g_free(devc->usbfd);
+
+    if (devc->dummy_source) {
+        devc->dummy_source = FALSE;
+        sr_source_remove(-1);
+    }
+    else if (devc->usbfd) {
+        /* Remove fds from polling. */
+        for (i = 0; devc->usbfd[i] != -1; i++)
+            sr_source_remove(devc->usbfd[i]);
+    }
+
+    if (devc->usbfd) {
+        g_free(devc->usbfd);
+        devc->usbfd = NULL;
+    }
 }
 
 static int receive_data(int fd, int revents, const struct sr_dev_inst *sdi)
@@ -1924,7 +1935,13 @@ static int receive_data(int fd, int revents, const struct sr_dev_inst *sdi)
     devc = sdi->priv;
     usb = sdi->conn;
 
-    tv.tv_sec = tv.tv_usec = 0;
+    if (devc->dummy_source) {
+        tv.tv_sec = 0;
+        tv.tv_usec = 10000;
+    }
+    else {
+        tv.tv_sec = tv.tv_usec = 0;
+    }
     libusb_handle_events_timeout_completed(drvc->sr_ctx->libusb_ctx, &tv, &completed);
 
     if (devc->trf_completed)
@@ -1988,6 +2005,8 @@ static int dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
     devc->empty_transfer_count = 0;
     devc->empty_poll_count = 0;
     devc->status = DSL_INIT;
+    devc->dummy_source = FALSE;
+    devc->usbfd = NULL;
     devc->num_transfers = 0;
     devc->submitted_transfers = 0;
     devc->actual_samples = (devc->limit_samples + SAMPLES_ALIGN) & ~SAMPLES_ALIGN;
@@ -2089,21 +2108,39 @@ static int dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 
     /* setup callback function for data transfer */
     lupfd = libusb_get_pollfds(drvc->sr_ctx->libusb_ctx);
-    for (i = 0; lupfd[i]; i++);
 
-    if (!(devc->usbfd = g_try_malloc0(sizeof(struct libusb_pollfd) * (i + 1)))){
-        sr_err("%s,ERROR:failed to alloc memory.", __func__);
-    	return SR_ERR;
+    if (!lupfd) {
+        /* Windows WinUSB backend: no pollfds. Drive the libusb event loop
+         * from a timed dummy source instead of dereferencing NULL. */
+        sr_info("%s: no usb poll fds available, using a timed dummy source", __func__);
+
+        if (!(devc->usbfd = g_try_malloc0(sizeof(int) * 2))) {
+            sr_err("%s,ERROR:failed to alloc memory.", __func__);
+            return SR_ERR_MALLOC;
+        }
+        devc->usbfd[0] = -1;
+        devc->usbfd[1] = -1;
+        devc->dummy_source = TRUE;
+
+        sr_source_add(-1, 0, dsl_get_timeout(sdi), receive_data, sdi);
     }
+    else {
+        for (i = 0; lupfd[i]; i++);
 
-    for (i = 0; lupfd[i]; i++) {
-        sr_source_add(lupfd[i]->fd, lupfd[i]->events,
-                  dsl_get_timeout(sdi), receive_data, sdi);
-        devc->usbfd[i] = lupfd[i]->fd;
+        if (!(devc->usbfd = g_try_malloc0(sizeof(struct libusb_pollfd) * (i + 1)))){
+            sr_err("%s,ERROR:failed to alloc memory.", __func__);
+            return SR_ERR;
+        }
+
+        for (i = 0; lupfd[i]; i++) {
+            sr_source_add(lupfd[i]->fd, lupfd[i]->events,
+                      dsl_get_timeout(sdi), receive_data, sdi);
+            devc->usbfd[i] = lupfd[i]->fd;
+        }
+
+        devc->usbfd[i] = -1;
+        g_free(lupfd);
     }
-
-    devc->usbfd[i] = -1;
-    g_free(lupfd);
 
     wr_cmd.header.dest = DSL_CTL_START;
     wr_cmd.header.size = 0;

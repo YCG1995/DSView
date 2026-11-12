@@ -462,7 +462,16 @@ QString GetIconPath()
 QString GetAppDataDir()
 {
 //applicationDirPath not end with '/'
-#ifdef Q_OS_LINUX
+#ifdef Q_OS_ANDROID
+    /* Android 没有 ../share/DSView 这种目录布局，走 Linux 分支会 assert 后
+     * 走到函数末尾没有 return（未定义行为），启动瞬间就崩。
+     * 用应用私有目录：/data/data/<pkg>/files。 */
+    QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (base.isEmpty())
+        base = QCoreApplication::applicationDirPath();
+    QDir().mkpath(base);
+    return base;
+#elif defined(Q_OS_LINUX)
     QDir dir(QCoreApplication::applicationDirPath());
     if (dir.cd("..") && dir.cd("share") && dir.cd("DSView"))
     {

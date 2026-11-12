@@ -109,8 +109,23 @@ public:
         return _decoder;
     }
 
+    inline const char* id() const {
+        return _decoder->id;
+    }
+
+    // Python package / directory name (e.g. "0-i2c"), distinct from id().
+    std::string module_name() const;
+
+    // Capture probe bindings keyed by channel id (before a script reload).
+    std::map<std::string, int> export_probe_ids() const;
+
+    // Point this decoder at a freshly reloaded srd_decoder and remap the
+    // previously captured probe bindings onto the new srd_channel objects.
+    void attach_decoder(const srd_decoder *dec,
+                        const std::map<std::string, int> &probe_ids);
+
 private:
-	const srd_decoder *const _decoder;
+	const srd_decoder *_decoder;
  
     std::map<const srd_channel*, int>   _probes;
 	std::map<std::string, GVariant*>    _options;

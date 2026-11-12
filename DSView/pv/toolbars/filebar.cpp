@@ -72,7 +72,10 @@ FileBar::FileBar(SigSession *session, QWidget *parent) :
      
     _action_capture = new QAction(this);
     _action_capture->setObjectName(QString::fromUtf8("actionCapture"));
- 
+
+    _action_reload = new QAction(this);
+    _action_reload->setObjectName(QString::fromUtf8("actionReloadScripts"));
+
     _file_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
     _file_button.setPopupMode(QToolButton::InstantPopup);
 
@@ -82,6 +85,7 @@ FileBar::FileBar(SigSession *session, QWidget *parent) :
     _menu->addAction(_action_save);
     _menu->addAction(_action_export);
     _menu->addAction(_action_capture);
+    _menu->addAction(_action_reload);
     _file_button.setMenu(_menu);
     addWidget(&_file_button);
 
@@ -92,6 +96,7 @@ FileBar::FileBar(SigSession *session, QWidget *parent) :
     connect(_action_save, SIGNAL(triggered()), this, SIGNAL(sig_save()));
     connect(_action_export, SIGNAL(triggered()), this, SIGNAL(sig_export()));
     connect(_action_capture, SIGNAL(triggered()), this, SLOT(on_actionCapture_triggered()));
+    connect(_action_reload, SIGNAL(triggered()), this, SLOT(on_actionReload_triggered()));
 
     ADD_UI(this);
 }
@@ -112,6 +117,7 @@ void FileBar::retranslateUi()
     _action_save->setText(L_S(STR_PAGE_TOOLBAR, S_ID(IDS_TOOLBAR_FILE_SAVE), "&Save..."));
     _action_export->setText(L_S(STR_PAGE_TOOLBAR, S_ID(IDS_TOOLBAR_FILE_EXPORT), "&Export..."));
     _action_capture->setText(L_S(STR_PAGE_TOOLBAR, S_ID(IDS_TOOLBAR_FILE_CAPTURE), "&Capture..."));
+    _action_reload->setText(QString::fromUtf8("重载脚本"));
 }
 
 void FileBar::reStyle()
@@ -239,6 +245,12 @@ void FileBar::on_actionCapture_triggered()
     _file_button.close();
     QCoreApplication::sendPostedEvents();
     QTimer::singleShot(100, this, SIGNAL(sig_screenShot()));
+}
+
+void FileBar::on_actionReload_triggered()
+{
+    _file_button.close();
+    emit sig_reload_scripts(_session->reload_decoder_scripts());
 }
 
 void FileBar::update_view_status()

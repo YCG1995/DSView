@@ -68,6 +68,7 @@ signals:
     void sig_measure(bool visible);//post decode button click event,to show or hide measure property panel
     void sig_search(bool visible);
     void sig_show_lissajous(bool visible);
+    void sig_pps_result(bool visible);   //show or hide the 1PPS result window
 
 private slots:
     void on_actionDark_triggered();
@@ -82,6 +83,7 @@ public slots:
     void trigger_clicked();
     void measure_clicked();
     void search_clicked();
+    void set_pps_result_checked(bool visible);
 
 private:
     SigSession  *_session;
@@ -92,12 +94,14 @@ private:
     XToolButton _search_button;
     XToolButton _function_button;
     XToolButton _setting_button;
+    XToolButton _pps_button;
     QAction     *_trig_action;
     QAction     *_protocol_action;
     QAction     *_measure_action;
     QAction     *_search_action;
-    QAction     *_function_action; 
+    QAction     *_function_action;
     QAction     *_display_action;
+    QAction     *_pps_action;
 
     QMenu       *_function_menu;
     QAction     *_action_fft;

@@ -21,6 +21,7 @@
  */
 
 #include <libsigrokdecode.h>
+#include <Python.h>
 #include "decoder.h"
 #include <assert.h>
 #include "../../log.h"
@@ -145,8 +146,52 @@ bool Decoder::have_required_probes()
 	return true;
 }
 
-srd_decoder_inst* Decoder::create_decoder_inst(srd_session *session)
+std::string Decoder::module_name() const
 {
+    if (!_decoder || !_decoder->module_name)
+        return std::string();
+
+    return std::string(_decoder->module_name);
+}
+
+std::map<std::string, int> Decoder::export_probe_ids() const
+{
+    std::map<std::string, int> result;
+
+    for (auto &kv : _probes)
+        result[kv.first->id] = kv.second;
+
+    return result;
+}
+
+void Decoder::attach_decoder(const srd_decoder *dec,
+                             const std::map<std::string, int> &probe_ids)
+{
+    _decoder = dec;
+
+    // Index the new decoder's channels by id.
+    std::map<std::string, const srd_channel*> channels;
+
+    for (GSList *l = dec->channels; l; l = l->next)
+        channels[((const srd_channel*)l->data)->id] = (const srd_channel*)l->data;
+    for (GSList *l = dec->opt_channels; l; l = l->next)
+        channels[((const srd_channel*)l->data)->id] = (const srd_channel*)l->data;
+
+    // Remap the captured bindings onto the new channel objects.
+    std::map<const srd_channel*, int> new_probes;
+
+    for (auto &kv : probe_ids) {
+        auto it = channels.find(kv.first);
+        if (it != channels.end())
+            new_probes[it->second] = kv.second;
+    }
+
+    _probes = new_probes;
+    _probes_back = new_probes;
+    _setted = true;
+}
+
+srd_decoder_inst* Decoder::create_decoder_inst(srd_session *session){
 	GHashTable *const opt_hash = g_hash_table_new_full(g_str_hash,
 		g_str_equal, g_free, (GDestroyNotify)g_variant_unref);
 

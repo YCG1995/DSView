@@ -34,7 +34,10 @@
 #include <QEvent>
 #include <QtGlobal>
 #include <QApplication>
+#include <QSettings>
+#include <QDialog>
 #include <QStandardPaths>
+#include <QTimer>
 #include <QScreen>
 #include <QTimer>
 #include <libusb-1.0/libusb.h>
@@ -42,6 +45,9 @@
 #include <QTextStream>
 #include <QJsonValue>
 #include <QJsonArray>
+#include <QJsonObject>
+#include <QJsonDocument>
+#include <QFile>
 #include <functional>
 #include "utility/formatting.h"
 
@@ -71,6 +77,15 @@
 #include "dock/triggerdock.h"
 #include "dock/dsotriggerdock.h"
 #include "dock/measuredock.h"
+#include "dock/ppsresultdock.h"
+#include "pps/ppsmanager.h"
+#include "pps/ppscalibration.h"
+#include "pps/ppswavewindow.h"
+#include "dialogs/ppsconfigdlg.h"
+#include "dialogs/ppscalibdlg.h"
+
+#include <cmath>
+#include <QJsonArray>
 #include "dock/searchdock.h"
 #include "dock/protocoldock.h"
 
@@ -96,7 +111,10 @@
 #include "utility/path.h"
 #include "log.h"
 #include "sigsession.h"
+#include "autosavemanager.h"
+#include "mcp/mcpserver.h"
 #include "deviceagent.h"
+#include <algorithm>
 #include <stdlib.h>
 #include "ZipMaker.h"
 #include "ui/langresource.h"
@@ -135,12 +153,189 @@ namespace pv
 
         setup_ui();
 
+        // Auto-save manager (repeat mode, background .dsl writes)
+        _auto_save_mgr = new AutoSaveManager(_session, this);
+        connect(_auto_save_mgr, &AutoSaveManager::status_changed,
+                this, [this](const QString &text){
+            if (text.isEmpty()){
+                statusBar()->hide();
+            }
+            else{
+                statusBar()->showMessage(text);
+                statusBar()->show();
+            }
+        });
+        statusBar()->setSizeGripEnabled(false);
+        statusBar()->hide();
+
+        // MCP control endpoint (loopback only). Port is configurable via
+        // the DSVIEW_MCP_PORT environment variable.
+        _mcp_server = new mcp::McpServer(this);
+        _mcp_server->set_session(_session);
+        _mcp_server->set_view(_view);  // _view is created in setup_ui() above
+        _mcp_server->set_data_getter(this);  // MainWindow implements ISessionDataGetter
+        _mcp_server->set_pps_control(this);  // ... and mcp::IPpsControl (1PPS mode)
+        quint16 mcp_port = 6347;
+        const QByteArray env_port = qgetenv("DSVIEW_MCP_PORT");
+        if (!env_port.isEmpty())
+            mcp_port = env_port.toUShort();
+        if (!_mcp_server->start(mcp_port))
+            dsv_warn("Failed to start MCP server on port %d", mcp_port);
+
+        // 1PPS measurement mode: the manager and the result dock are created
+        // on first use (see ensure_pps()), so nothing is added to the window
+        // layout during startup.
         setContextMenuPolicy(Qt::NoContextMenu);
 
         _key_vaild = false;
         _last_key_press_time = high_resolution_clock::now();
 
         update_title_bar_text();
+
+        // Automation hook for headless validation of the 1PPS measurement mode:
+        // it is inert unless DSVIEW_PPS_AUTOSTART=1 is set in the environment.
+        // DSVIEW_PPS_AUTOSTART_DELAY_MS tunes the start delay (default 2500 ms),
+        // DSVIEW_PPS_AUTOSTOP_MS then stops the measurement after that delay.
+        if (qgetenv("DSVIEW_PPS_AUTOSTART") == "1") {
+            const int stop_after_ms = qgetenv("DSVIEW_PPS_AUTOSTOP_MS").toInt();
+            int start_delay_ms = qgetenv("DSVIEW_PPS_AUTOSTART_DELAY_MS").toInt();
+            if (start_delay_ms <= 0)
+                start_delay_ms = 2500;
+            QTimer::singleShot(start_delay_ms, this, [this]() {
+                // ensure_pps() first: the manager only exists after this call.
+                on_pps_result(true);
+
+                // Optional head-less configuration override, only for automated
+                // validation: DSVIEW_PPS_TESTCFG points at a JSON file with
+                // {ref_channel, ref_edge(0/1), sample_rate, capture_ms,
+                //  channels:[{ch, edge(0/1)}], disabled:[...]}.
+                const QByteArray cfg_path = qgetenv("DSVIEW_PPS_TESTCFG");
+                if (!cfg_path.isEmpty() && _pps_manager) {
+                    QFile f(QString::fromUtf8(cfg_path));
+                    if (f.open(QIODevice::ReadOnly)) {
+                        const QJsonObject o =
+                            QJsonDocument::fromJson(f.readAll()).object();
+                        pps::PpsConfig cfg = _pps_manager->config();
+                        if (o.contains("ref_channel"))
+                            cfg.ref_channel = o.value("ref_channel").toInt();
+                        if (o.contains("ref_edge"))
+                            cfg.ref_edge = o.value("ref_edge").toInt();
+                        if (o.contains("sample_rate"))
+                            cfg.sample_rate = static_cast<uint64_t>(
+                                o.value("sample_rate").toDouble());
+                        if (o.contains("capture_ms"))
+                            cfg.capture_time_ms = o.value("capture_ms").toDouble();
+                        if (o.contains("range"))
+                            cfg.mode_channels = o.value("range").toInt();
+                        if (o.contains("channels")) {
+                            cfg.channels.clear();
+                            for (const QJsonValue &v : o.value("channels").toArray()) {
+                                pps::PpsChannel ch;
+                                ch.channel_index = v.toObject().value("ch").toInt();
+                                ch.edge = v.toObject().value("edge").toInt();
+                                ch.enabled = true;
+                                cfg.channels.push_back(ch);
+                            }
+                        }
+                        cfg.disabled_channels.clear();
+                        for (const QJsonValue &v : o.value("disabled").toArray())
+                            cfg.disabled_channels.push_back(v.toInt());
+                        _pps_manager->set_config(cfg);
+                        dsv_info("1PPS test config applied: ref CH%d edge %d, "
+                            "rate %llu, capture %.1f ms, %u channel(s)",
+                            cfg.ref_channel, cfg.ref_edge,
+                            (unsigned long long)cfg.sample_rate,
+                            cfg.capture_time_ms,
+                            (unsigned)cfg.channels.size());
+                    }
+                }
+                on_pps_start();
+            });
+            if (stop_after_ms > 0) {
+                QTimer::singleShot(start_delay_ms + stop_after_ms, this, [this]() {
+                    on_pps_stop();
+                });
+            }
+            // Automation hook: open the configuration dialog once and close it
+            // again, so the logged rate/channel list can be checked head-less
+            // (DSVIEW_PPS_OPENCFG=1).
+            if (qgetenv("DSVIEW_PPS_OPENCFG") == "1") {
+                QTimer::singleShot(start_delay_ms + stop_after_ms + 1000,
+                    this, [this]() {
+                    QTimer::singleShot(400, this, []() {
+                        // A screenshot run closes the dialog itself, after the grab.
+                        if (!qgetenv("DSVIEW_PPS_CONFIG_SHOT").isEmpty())
+                            return;
+                        const QWidgetList tops =
+                            QApplication::topLevelWidgets();
+                        for (QWidget *w : tops) {
+                            if (qobject_cast<QDialog *>(w))
+                                w->close();
+                        }
+                    });
+                    on_pps_config();
+                });
+            }
+        }
+
+        // Automation hook: open the waveform window on startup
+        // (DSVIEW_PPS_WAVE=1), so its rendering can be captured head-less.
+        if (qgetenv("DSVIEW_PPS_WAVE") == "1") {
+            QTimer::singleShot(2000, this, [this]() { on_pps_wave(); });
+        }
+
+        // Automation hook: run the calibration dialog on startup
+        // (DSVIEW_PPS_CALIB_AUTO=1), optionally grabbing it to a png.
+        if (qgetenv("DSVIEW_PPS_CALIB_AUTO") == "1") {
+            QTimer::singleShot(3000, this, [this]() { on_pps_calib(); });
+        }
+
+        // Automation hook for the result-window UI: DSVIEW_PPS_DOCK_SHOT=<png>
+        // grabs the whole window with the dock shown, then clicks the toolbar's
+        // PPS button (the real signal path) to hide and show it again, saving
+        // <png>.hidden.png and <png>.shown.png so both states can be checked.
+        const QString dock_shot = QString::fromUtf8(qgetenv("DSVIEW_PPS_DOCK_SHOT"));
+        if (!dock_shot.isEmpty()) {
+            int shot_ms = qgetenv("DSVIEW_PPS_DOCK_SHOT_MS").toInt();
+            if (shot_ms <= 0)
+                shot_ms = 4000;
+            QTimer::singleShot(shot_ms, this, [this, dock_shot]() {
+                on_pps_result(true);
+                QTimer::singleShot(300, this, [this, dock_shot]() {
+                    grab().save(dock_shot);
+
+                    // Evidence for the head-less checks: the calibrate button must
+                    // be disabled while a measurement is running.
+                    if (QToolButton *cb = findChild<QToolButton*>("ppsCalibButton"))
+                        dsv_info("1PPS dock: calib button enabled=%d (running=%d)",
+                            cb->isEnabled() ? 1 : 0,
+                            (_pps_manager && _pps_manager->is_running()) ? 1 : 0);
+
+                    QToolButton *pps_btn = findChild<QToolButton*>("ppsToolButton");
+                    if (!pps_btn)
+                        return;
+
+                    pps_btn->click(); // the toolbar toggle itself
+                    QTimer::singleShot(200, this, [this, dock_shot]() {
+                        grab().save(dock_shot + ".hidden.png");
+                        QToolButton *pps_btn = findChild<QToolButton*>("ppsToolButton");
+                        if (pps_btn)
+                            pps_btn->click();
+                        QTimer::singleShot(200, this, [this, dock_shot]() {
+                            grab().save(dock_shot + ".shown.png");
+                            // Optional: exercise the dock's configure icon, so
+                            // the icon -> dialog route is checked too.
+                            if (qgetenv("DSVIEW_PPS_DOCK_CLICK_CFG") == "1") {
+                                QToolButton *cfg_btn =
+                                    findChild<QToolButton*>("ppsConfigButton");
+                                if (cfg_btn)
+                                    cfg_btn->click();
+                            }
+                        });
+                    });
+                });
+            });
+        }
     }
 
     void MainWindow::setup_ui()
@@ -276,6 +471,8 @@ namespace pv
         connect(_trig_bar, SIGNAL(sig_search(bool)), this, SLOT(on_search(bool)));
         connect(_trig_bar, SIGNAL(sig_setTheme(QString)), this, SLOT(switchTheme(QString)));
         connect(_trig_bar, SIGNAL(sig_show_lissajous(bool)), _view, SLOT(show_lissajous(bool)));
+        connect(_trig_bar, &toolbars::TrigBar::sig_pps_result,
+                this, &MainWindow::on_pps_result);
 
         // file toolbar
         connect(_file_bar, SIGNAL(sig_load_file(QString)), this, SLOT(on_load_file(QString)));
@@ -284,6 +481,11 @@ namespace pv
         connect(_file_bar, SIGNAL(sig_screenShot()), this, SLOT(on_screenShot()), Qt::QueuedConnection);
         connect(_file_bar, SIGNAL(sig_load_session(QString)), this, SLOT(on_load_session(QString)));
         connect(_file_bar, SIGNAL(sig_store_session(QString)), this, SLOT(on_store_session(QString)));
+        connect(_file_bar, &toolbars::FileBar::sig_reload_scripts, this,
+                [this](const QString &text){
+            statusBar()->showMessage(text, 8000);
+            statusBar()->show();
+        });
 
         // logobar
         connect(_logo_bar, SIGNAL(sig_open_doc()), this, SLOT(on_open_doc()));
@@ -411,6 +613,17 @@ namespace pv
             break;
         }
 
+        // While the 1PPS measurement loop runs, a modal dialog would block the
+        // GUI thread and silently stall (or wedge) the measurement. Report the
+        // error through the log instead and stop the measurement cleanly.
+        if (_pps_manager && _pps_manager->is_running()) {
+            dsv_err("1PPS measurement aborted by session error: %s - %s",
+                    title.toUtf8().constData(), details.toUtf8().constData());
+            _session->clear_error();
+            on_pps_stop();
+            return;
+        }
+
         pv::dialogs::DSMessageBox msg(this, title);
         msg.mBox()->setText(details);
         msg.mBox()->setStandardButtons(QMessageBox::Ok);
@@ -512,6 +725,442 @@ namespace pv
 
         if (!visible)
             _view->setFocus();
+    }
+
+    void MainWindow::ensure_pps()
+    {
+        if (_pps_manager)
+            return;
+
+        _pps_manager = new pps::PpsManager(_session, this);
+        // Needed by the "save the anomalous frame" option: StoreSession asks the
+        // application for the session blob, and MainWindow is that provider.
+        _pps_manager->set_data_getter(this);
+        connect(_pps_manager, &pps::PpsManager::status_message,
+                this, &MainWindow::on_pps_status);
+
+        // The calibration coefficient is a property of the analyzer, not of a
+        // single session, so it survives restarts.
+        {
+            QSettings st(QApplication::organizationName(),
+                QApplication::applicationName());
+            const double f = st.value("pps/calib_factor", 1.0).toDouble();
+            if (f > 0.0)
+                _pps_manager->set_calib_factor(f);
+        }
+
+        _pps_dock = new QDockWidget(QString::fromUtf8("1PPS 测量"), this);
+        _pps_dock->setObjectName("pps_dock");
+        _pps_dock->setAllowedAreas(Qt::RightDockWidgetArea);
+        _pps_dock->setFeatures(QDockWidget::DockWidgetMovable |
+                QDockWidget::DockWidgetClosable);
+        _pps_result = new dock::PpsResultDock(_pps_manager, _pps_dock);
+        _pps_dock->setWidget(_pps_result);
+        addDockWidget(Qt::RightDockWidgetArea, _pps_dock);
+        _pps_dock->hide();
+        connect(_pps_dock, &QDockWidget::visibilityChanged,
+                _trig_bar, &toolbars::TrigBar::set_pps_result_checked);
+        connect(_pps_result, &dock::PpsResultDock::config_requested,
+                this, &MainWindow::on_pps_config);
+        connect(_pps_result, &dock::PpsResultDock::start_requested,
+                this, &MainWindow::on_pps_start);
+        connect(_pps_result, &dock::PpsResultDock::stop_requested,
+                this, &MainWindow::on_pps_stop);
+        connect(_pps_result, &dock::PpsResultDock::calib_requested,
+                this, &MainWindow::on_pps_calib);
+        connect(_pps_result, &dock::PpsResultDock::wave_requested,
+                this, &MainWindow::on_pps_wave);
+    }
+
+    void MainWindow::on_pps_config()
+    {
+        ensure_pps();
+        dialogs::PpsConfigDlg dlg(_session, _pps_manager->config(), this);
+        // Head-less check hook: DSVIEW_PPS_CONFIG_SHOT=<png> grabs the dialog
+        // once it has been laid out, so the layout can be inspected without a
+        // person clicking through the menus.
+        const QString cfg_shot = QString::fromUtf8(qgetenv("DSVIEW_PPS_CONFIG_SHOT"));
+        if (!cfg_shot.isEmpty()) {
+            QTimer::singleShot(1500, &dlg, [&dlg, cfg_shot]() {
+                dlg.grab().save(cfg_shot);
+                dlg.accept();
+            });
+        }
+        if (dlg.exec() == QDialog::Accepted) {
+            // set_config() stores the whole setup in QSettings, so the dialog
+            // opens with the same values after a restart.
+            _pps_manager->set_config(dlg.result_config());
+            apply_pps_channels_to_session();
+        }
+    }
+
+    /*
+     * Mirrors the PPS channel set into the main capture: the reference channel
+     * and every measured channel are enabled, everything else is switched off.
+     * Without this the main view still looks at whatever the last normal
+     * capture used, which does not match what the PPS measurement samples.
+     */
+    void MainWindow::apply_pps_channels_to_session()
+    {
+        if (!_pps_manager || !_session || !_session->get_device())
+            return;
+
+        DeviceAgent *dev = _session->get_device();
+        const std::vector<int> set = _pps_manager->measured_channel_set();
+        for (GSList *l = dev->get_channels(); l; l = l->next) {
+            sr_channel *c = static_cast<sr_channel *>(l->data);
+            if (c->type != SR_CHANNEL_LOGIC)
+                continue;
+            const bool on = std::find(set.begin(), set.end(), c->index)
+                != set.end();
+            dev->enable_probe(c, on);
+        }
+        dsv_info("1PPS config: main capture channels mirrored (%d channel(s))",
+            (int)set.size());
+        if (_view)
+            _view->signals_changed(NULL);
+    }
+
+    void MainWindow::on_pps_start()
+    {
+        ensure_pps();
+        _pps_dock->setVisible(true);
+        _trig_bar->set_pps_result_checked(true);
+
+        if (_pps_manager->is_running()) {
+            statusBar()->show();
+            statusBar()->showMessage(QString::fromUtf8("1PPS 测量已在运行。"), 5000);
+            return;
+        }
+
+        // Mirror the configured 1PPS channels onto the main capture view before
+        // the device is taken over, so what the user measures in the PPS panel is
+        // what the main waveform is set up for.
+        apply_pps_channels_to_session();
+
+        // Start directly: missing options are derived from the active device.
+        if (!_pps_manager->start()) {
+            statusBar()->show();
+            QMessageBox::warning(this, QString::fromUtf8("1PPS 测量"),
+                    _pps_manager->start_error());
+            _pps_result->refresh();
+        }
+        else {
+            _pps_result->refresh(); // update the dock's start/stop buttons
+        }
+    }
+
+    void MainWindow::on_pps_stop()
+    {
+        if (_pps_manager)
+            _pps_manager->stop();
+        if (_pps_result)
+            _pps_result->refresh();
+    }
+
+    void MainWindow::on_pps_result(bool visible)
+    {
+        ensure_pps();
+        _pps_dock->setVisible(visible);
+        _trig_bar->set_pps_result_checked(visible);
+    }
+
+    void MainWindow::on_pps_calib()
+    {
+        ensure_pps();
+
+        // The calibration run owns the device for its whole duration, so it
+        // cannot share the hardware with a running measurement. The button is
+        // greyed out while measuring; this is the guarded entry point for the
+        // other ways in (menu, MCP, automation).
+        if (_pps_manager->is_running()) {
+            statusBar()->show();
+            statusBar()->showMessage(QString::fromUtf8(
+                "1PPS 测量正在运行，请先停止测量再校准。"), 8000);
+            if (_pps_result)
+                _pps_result->refresh();
+            return;
+        }
+
+        // Channel count of the active mode is the honest upper bound.
+        pps::PpsDeviceCaps caps;
+        pps::query_device_caps(_session, caps);
+        const int max_ch = caps.channel_num > 0 ? caps.channel_num - 1 : 7;
+        int def_ch = _pps_manager->config().ref_channel;
+        const int ch_override = qgetenv("DSVIEW_PPS_CALIB_CH").toInt();
+        if (ch_override > 0 || qgetenv("DSVIEW_PPS_CALIB_CH") == "0")
+            def_ch = ch_override;
+        if (def_ch < 0 || def_ch > max_ch)
+            def_ch = 0;
+
+        dialogs::PpsCalibDlg dlg(_session, def_ch, max_ch, this);
+        // Head-less check hook: DSVIEW_PPS_CALIB_SHOT=<png> starts the run by
+        // itself and grabs the dialog before closing it.
+        const QString calib_shot = QString::fromUtf8(qgetenv("DSVIEW_PPS_CALIB_SHOT"));
+        if (!calib_shot.isEmpty()) {
+            QTimer::singleShot(600, &dlg, [&dlg]() {
+                QMetaObject::invokeMethod(&dlg, "on_start");
+            });
+            const int shot_ms = qgetenv("DSVIEW_PPS_CALIB_SHOT_MS").toInt();
+            QTimer::singleShot(shot_ms > 0 ? shot_ms : 45000, &dlg,
+                [&dlg, calib_shot]() {
+                dlg.grab().save(calib_shot);
+                dlg.accept();
+            });
+        }
+        dlg.exec();
+
+        if (dlg.has_result()) {
+            const double f = dlg.factor();
+            _pps_manager->set_calib_factor(f);
+            QSettings st(QApplication::organizationName(),
+                QApplication::applicationName());
+            st.setValue("pps/calib_factor", _pps_manager->calib_factor());
+            dsv_info("1PPS calib: coefficient %.9f stored in the config", f);
+            statusBar()->show();
+            statusBar()->showMessage(QString::fromUtf8(
+                "校准系数已更新为 %1，所有时间差将按该系数换算。")
+                .arg(f, 0, 'f', 9), 8000);
+        }
+    }
+
+    void MainWindow::on_pps_wave()
+    {
+        ensure_pps();
+        // Independent top level window: parented for ownership only, so it can
+        // be moved to another screen without dragging the main window.
+        if (_pps_wave.isNull())
+            _pps_wave = new pps::PpsWaveWindow(_pps_manager, this);
+        _pps_wave->show();
+        _pps_wave->raise();
+        _pps_wave->activateWindow();
+    }
+
+    void MainWindow::on_pps_status(const QString &text)
+    {
+        statusBar()->showMessage(text, 8000);
+    }
+
+    // ---- 1PPS over MCP ----------------------------------------------------
+    // The three helpers below translate between pps::PpsConfig and the JSON
+    // shape used by the MCP tools (get_pps_config / set_pps_config).
+    static QJsonObject pps_config_json(const pps::PpsConfig &cfg)
+    {
+        QJsonArray channels;
+        for (size_t i = 0; i < cfg.channels.size(); ++i) {
+            QJsonObject o;
+            o["ch"] = cfg.channels[i].channel_index;
+            o["edge"] = cfg.channels[i].edge;
+            o["save"] = cfg.channels[i].save_on_loss;
+            channels.append(o);
+        }
+
+        QJsonArray disabled;
+        for (size_t i = 0; i < cfg.disabled_channels.size(); ++i)
+            disabled.append(cfg.disabled_channels[i]);
+
+        QJsonObject o;
+        o["ref_channel"] = cfg.ref_channel;
+        o["ref_edge"] = cfg.ref_edge;
+        o["trigger_pos_percent"] = cfg.trigger_pos_percent;
+        o["capture_ms"] = cfg.capture_time_ms;
+        o["sample_rate"] = static_cast<double>(cfg.sample_rate);
+        o["save_dir"] = cfg.save_dir;
+        o["range"] = cfg.mode_channels;
+        o["auto_save_loss"] = cfg.auto_save_loss;
+        o["calib_factor"] = cfg.calib_factor;
+        o["channels"] = channels;
+        o["disabled"] = disabled;
+        return o;
+    }
+
+    static void pps_config_apply(const QJsonObject &o, pps::PpsConfig &cfg)
+    {
+        if (o.contains("ref_channel"))
+            cfg.ref_channel = o.value("ref_channel").toInt();
+        if (o.contains("ref_edge"))
+            cfg.ref_edge = o.value("ref_edge").toInt();
+        if (o.contains("trigger_pos_percent"))
+            cfg.trigger_pos_percent = o.value("trigger_pos_percent").toInt();
+        if (o.contains("capture_ms"))
+            cfg.capture_time_ms = o.value("capture_ms").toDouble();
+        if (o.contains("sample_rate"))
+            cfg.sample_rate = static_cast<uint64_t>(
+                o.value("sample_rate").toDouble());
+        if (o.contains("save_dir"))
+            cfg.save_dir = o.value("save_dir").toString();
+        if (o.contains("range"))
+            cfg.mode_channels = o.value("range").toInt();
+        if (o.contains("auto_save_loss"))
+            cfg.auto_save_loss = o.value("auto_save_loss").toBool();
+        if (o.contains("calib_factor")) {
+            const double f = o.value("calib_factor").toDouble(1.0);
+            if (f > 0.0)
+                cfg.calib_factor = f;
+        }
+        if (o.contains("channels")) {
+            cfg.channels.clear();
+            for (const QJsonValue &v : o.value("channels").toArray()) {
+                const QJsonObject c = v.toObject();
+                pps::PpsChannel ch;
+                ch.channel_index = c.value("ch").toInt();
+                ch.edge = c.value("edge").toInt(cfg.ref_edge);
+                ch.enabled = true;
+                ch.save_on_loss = c.value("save").toBool(cfg.auto_save_loss);
+                cfg.channels.push_back(ch);
+            }
+        }
+        if (o.contains("disabled")) {
+            cfg.disabled_channels.clear();
+            for (const QJsonValue &v : o.value("disabled").toArray())
+                cfg.disabled_channels.push_back(v.toInt());
+        }
+    }
+
+    QJsonObject MainWindow::pps_describe()
+    {
+        ensure_pps();
+
+        QJsonObject out;
+        out["config"] = pps_config_json(_pps_manager->config());
+
+        pps::PpsDeviceCaps caps;
+        if (pps::query_device_caps(_session, caps)) {
+            QJsonArray rates;
+            for (size_t i = 0; i < caps.rates.size(); ++i)
+                rates.append(static_cast<double>(caps.rates[i]));
+
+            QJsonArray modes;
+            for (size_t i = 0; i < caps.modes.size(); ++i) {
+                QJsonObject m;
+                m["id"] = caps.modes[i].id;
+                m["channels"] = caps.modes[i].channels;
+                m["max_rate"] = static_cast<double>(caps.modes[i].max_rate);
+                modes.append(m);
+            }
+
+            const pps::PpsConfig &cfg = _pps_manager->config();
+            QJsonObject c;
+            c["channel_num"] = caps.channel_num;
+            c["max_rate"] = static_cast<double>(caps.max_rate);
+            c["hw_depth"] = static_cast<double>(caps.hw_depth);
+            c["rates"] = rates;
+            c["modes"] = modes;
+            c["channels_for_rate"] =
+                caps.channels_for_rate(cfg.sample_rate);
+            c["max_capture_ms"] = caps.max_capture_ms(
+                cfg.sample_rate, caps.channels_for_rate(cfg.sample_rate));
+            out["device"] = c;
+        }
+
+        out["running"] = _pps_manager->is_running();
+        return out;
+    }
+
+    bool MainWindow::pps_configure(const QJsonObject &cfg, QString &error)
+    {
+        ensure_pps();
+
+        if (_pps_manager->is_running()) {
+            error = QString::fromUtf8("1PPS 正在运行，请先调用 stop_pps 再修改配置。");
+            return false;
+        }
+
+        pps::PpsConfig next = _pps_manager->config();
+        pps_config_apply(cfg, next);
+        _pps_manager->set_config(next);
+
+        // Normalise against the device (samplerate wins over channel range)
+        // and surface the driver error if nothing usable is left.
+        if (!_pps_manager->prepare_config()) {
+            error = _pps_manager->start_error();
+            if (error.isEmpty())
+                error = QString::fromUtf8("1PPS 配置无法在当前设备上成立。");
+            return false;
+        }
+        return true;
+    }
+
+    bool MainWindow::pps_start(QString &error)
+    {
+        ensure_pps();
+        _pps_dock->setVisible(true);
+        _trig_bar->set_pps_result_checked(true);
+
+        if (_pps_manager->is_running()) {
+            error = QString::fromUtf8("1PPS 已在运行。");
+            return false;
+        }
+
+        // Unlike on_pps_start() this never opens a modal box: an MCP client
+        // gets the failure text instead of a dialog it cannot dismiss.
+        if (!_pps_manager->start()) {
+            error = _pps_manager->start_error();
+            if (error.isEmpty())
+                error = QString::fromUtf8("1PPS 启动失败。");
+            _pps_result->refresh();
+            return false;
+        }
+
+        _pps_result->refresh();
+        return true;
+    }
+
+    void MainWindow::pps_stop()
+    {
+        if (_pps_manager)
+            _pps_manager->stop();
+        if (_pps_result)
+            _pps_result->refresh();
+    }
+
+    // 1PPS deltas are reported with one decimal place, after the calibration
+    // factor has been applied.
+    static double pps_round(double v)
+    {
+        return std::round(v * 10.0) / 10.0;
+    }
+
+    QJsonObject MainWindow::pps_status()
+    {
+        ensure_pps();
+
+        QJsonObject out;
+        out["running"] = _pps_manager->is_running();
+        out["frame_count"] = _pps_manager->frame_count();
+        out["csv_path"] = _pps_manager->csv_path();
+        out["last_capture_ms"] = _pps_manager->last_capture_ms();
+        out["last_report_ms"] = _pps_manager->last_report_ms();
+        out["last_total_ms"] = _pps_manager->last_total_ms();
+
+        QJsonArray results;
+        const std::vector<pps::PpsResult> &last = _pps_manager->last_results();
+        for (size_t i = 0; i < last.size(); ++i) {
+            QJsonObject r;
+            r["ch"] = last[i].channel_index;
+            r["valid"] = last[i].valid;
+            r["delta_ns"] = pps_round(last[i].delta_ns);
+            results.append(r);
+        }
+        out["results"] = results;
+
+        QJsonArray stats;
+        const std::vector<pps::PpsStats> s = _pps_manager->statistics();
+        for (size_t i = 0; i < s.size(); ++i) {
+            QJsonObject o;
+            o["ch"] = s[i].channel_index;
+            o["count"] = s[i].count;
+            o["mean_ns"] = pps_round(s[i].mean);
+            o["min_ns"] = pps_round(s[i].minimum);
+            o["max_ns"] = pps_round(s[i].maximum);
+            o["stddev_ns"] = pps_round(s[i].stddev);
+            stats.append(o);
+        }
+        out["statistics"] = stats;
+        out["loss_frames"] = _pps_manager->loss_frame_count();
+        out["last_dsl_path"] = _pps_manager->last_dsl_path();
+
+        return out;
     }
 
     void MainWindow::on_search(bool visible)
@@ -1214,6 +1863,11 @@ namespace pv
             }
         }
 
+        // The restored layout may show docks that were closed when the state
+        // was saved; keep the PPS menu entry in sync with the real visibility.
+        if (_pps_dock && _trig_bar)
+            _trig_bar->set_pps_result_checked(_pps_dock->isVisible());
+
         // Resotre the dock pannel.
         if (_device_agent->have_instance())
             _trig_bar->reload();
@@ -1814,7 +2468,18 @@ namespace pv
             }
             case DSV_MSG_START_COLLECT_WORK_PREV:
             {
-                if (_device_agent->get_work_mode() == LOGIC)
+                // While a 1PPS measurement drives the acquisition, the PPS
+                // manager owns the trigger configuration. Letting the trigger
+                // dock re-apply its own settings here would reset trigger_en to
+                // 0 and the position to the dock slider value, so the capture
+                // would never trigger and every frame came back flat.
+                // A calibration run owns the trigger the same way: without this
+                // check each calibration frame was captured free-running, the
+                // reference edge landed at an arbitrary phase in the window, and
+                // a 1.2 s window then only held two edges ~20% of the time.
+                if (_device_agent->get_work_mode() == LOGIC
+                        && !(_pps_manager && _pps_manager->is_running())
+                        && !pps::PpsCalibration::any_active())
                     _trigger_widget->try_commit_trigger();
                 else if (_device_agent->get_work_mode() == DSO)
                     _dso_trigger_widget->check_setting();
@@ -2176,6 +2841,12 @@ namespace pv
         if (_strMsg != ""){
             _delay_prop_msg_timer.Start(500);
         }
+    }
+
+    void MainWindow::auto_save_frame()
+    {
+        // MainWindow itself implements ISessionDataGetter.
+        _auto_save_mgr->start_frame(this);
     }
 
     void MainWindow::on_delay_prop_msg()

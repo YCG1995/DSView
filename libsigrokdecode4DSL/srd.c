@@ -33,6 +33,91 @@ SRD_PRIV GSList *searchpaths = NULL;
 extern SRD_PRIV GSList *sessions;
 extern SRD_PRIV int max_session_id;
 
+/* Console capture is implemented in pure Python because this build uses the
+ * limited C API (Py_LIMITED_API), under which PyTypeObject is opaque.
+ *
+ * A small file-like object buffers write() calls; the same instance is set as
+ * sys.stdout and sys.stderr and stashed on the sys module so the C side can
+ * reach it via limited-API calls. */
+static const char CONSOLE_SETUP_SCRIPT[] =
+	"class _DSViewConsole:\n"
+	"    def __init__(self):\n"
+	"        self._parts = []\n"
+	"    def write(self, s):\n"
+	"        if s:\n"
+	"            self._parts.append(s)\n"
+	"    def flush(self):\n"
+	"        pass\n"
+	"    def take(self, clear):\n"
+	"        text = ''.join(self._parts)\n"
+	"        if clear:\n"
+	"            self._parts = []\n"
+	"        return text\n"
+	"import sys\n"
+	"cap = _DSViewConsole()\n"
+	"sys.stdout = cap\n"
+	"sys.stderr = cap\n"
+	"sys._dsview_console = cap\n";
+
+/* Redirect sys.stdout / sys.stderr to the capture object. Called while the
+ * GIL is held, right after Py_InitializeEx(). */
+static void install_console_capture(void)
+{
+	PyObject *code_obj, *res;
+
+	/* PyRun_SimpleString is unavailable under the limited API; compile and
+	 * evaluate the setup snippet explicitly instead. */
+	code_obj = Py_CompileString(CONSOLE_SETUP_SCRIPT,
+			"<dsview_console>", Py_file_input);
+	if (!code_obj) {
+		PyErr_Clear();
+		return;
+	}
+
+	res = PyEval_EvalCode(code_obj, PyEval_GetBuiltins(),
+			PyEval_GetBuiltins());
+	Py_XDECREF(res);
+	Py_DECREF(code_obj);
+	if (!res)
+		PyErr_Clear();
+}
+
+SRD_API char *srd_console_take(int do_clear)
+{
+	PyObject *sys_mod, *cap, *text_obj;
+	const char *text;
+	char *result;
+	PyGILState_STATE gstate;
+
+	gstate = PyGILState_Ensure();
+
+	sys_mod = PyImport_AddModule("sys");
+	cap = sys_mod ? PyObject_GetAttrString(sys_mod, "_dsview_console")
+			: NULL;
+	text_obj = cap ? PyObject_CallMethod(cap, "take", "i", do_clear)
+			: NULL;
+	if (text_obj) {
+		PyObject *bytes = PyUnicode_AsUTF8String(text_obj);
+		text = bytes ? PyBytes_AsString(bytes) : NULL;
+		result = g_strdup(text ? text : "");
+		Py_XDECREF(bytes);
+	} else {
+		result = g_strdup("");
+	}
+
+	Py_XDECREF(text_obj);
+	Py_XDECREF(cap);
+
+	PyGILState_Release(gstate);
+	return result;
+}
+
+SRD_API void srd_console_clear(void)
+{
+	char *p = srd_console_take(1);
+	g_free(p);
+}
+
 /** @endcond */
 
 /**
@@ -207,6 +292,9 @@ SRD_API int srd_init(const char *path)
 	/* Initialize the Python interpreter. */
     Py_InitializeEx(0); 
 
+	/* Capture decoder print() output for the MCP console tool. */
+	install_console_capture();
+
 #ifdef DECODERS_DIR
 	/* Hardcoded decoders install location, if defined. */
 	if ((ret = srd_decoder_searchpath_add(DECODERS_DIR)) != SRD_OK) {
@@ -255,7 +343,9 @@ SRD_API int srd_init(const char *path)
 	}
 
 	/* Initialize the Python GIL (this also happens to acquire it). */
+#if PY_VERSION_HEX < 0x030D0000
 	PyEval_InitThreads();
+#endif
 
 	/* Release the GIL (ignore return value, we don't need it here). */
 	PyEval_SaveThread();

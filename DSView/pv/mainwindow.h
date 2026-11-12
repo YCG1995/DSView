@@ -30,9 +30,11 @@
 #include "dialogs/dsmessagebox.h"
 #include "interface/icallbacks.h"
 #include "eventobject.h" 
+#include "mcp/mcpserver.h"
 #include <QJsonDocument>
 #include <chrono>
 #include <QTimer>
+#include <QPointer>
 #include "dstimer.h"
 
 class QAction;
@@ -50,8 +52,19 @@ using std::chrono::high_resolution_clock;
 using std::chrono::milliseconds;
 
 namespace pv {
- 
+
 class SigSession;
+class AutoSaveManager;
+
+namespace mcp {
+class McpServer;
+class IPpsControl;
+}
+
+namespace pps {
+class PpsManager;
+class PpsWaveWindow;
+}
 
 namespace toolbars {
 class SamplingBar;
@@ -67,6 +80,7 @@ class TriggerDock;
 class DsoTriggerDock;
 class MeasureDock;
 class SearchDock;
+class PpsResultDock;
 }
 
 namespace view {
@@ -80,7 +94,8 @@ class MainWindow :
     public ISessionCallback,
     public IMainForm,
     public ISessionDataGetter,
-    public IMessageListener
+    public IMessageListener,
+    public mcp::IPpsControl
 {
 	Q_OBJECT
 
@@ -125,7 +140,16 @@ private slots:
     void on_trigger_message(int msg);
     void on_delay_prop_msg();
     void on_load_device_first();
-  
+
+    void ensure_pps();
+    void on_pps_config();
+    void on_pps_start();
+    void on_pps_stop();
+    void on_pps_result(bool visible);
+    void on_pps_wave();
+    void on_pps_calib();
+    void on_pps_status(const QString &text);
+
 signals:
     void prgRate(int progress);
 
@@ -136,10 +160,21 @@ public:
     QWidget* GetBodyView();
 
     void OnWindowsPowerEvent(bool bEnterSleep);
-    
+
+public:
+    //mcp::IPpsControl — 1PPS measurement driven from the MCP endpoint.
+    QJsonObject pps_describe() override;
+    bool pps_configure(const QJsonObject &cfg, QString &error) override;
+    bool pps_start(QString &error) override;
+    void pps_stop() override;
+    QJsonObject pps_status() override;
+
 private: 
 	void setup_ui();
     void retranslateUi(); 
+    // Enables exactly the PPS channel set on the main capture, so the main view
+    // matches what the 1PPS measurement samples.
+    void apply_pps_channels_to_session();
     bool eventFilter(QObject *object, QEvent *event);
     void check_usb_device_speed();
     void reset_all_view();
@@ -181,8 +216,9 @@ private:
     void decode_done() override;
     void receive_data_len(quint64 len) override;
     void receive_header() override;    
-    void trigger_message(int msg) override;   
-    void delay_prop_msg(QString strMsg) override; 
+    void trigger_message(int msg) override;
+    void delay_prop_msg(QString strMsg) override;
+    void auto_save_frame() override;
 
     //ISessionDataGetter
     bool genSessionData(std::string &str) override;
@@ -234,6 +270,12 @@ private:
     EventObject     _event; 
     SigSession      *_session;
     DeviceAgent     *_device_agent;
+    AutoSaveManager *_auto_save_mgr;
+    mcp::McpServer *_mcp_server;
+    pps::PpsManager *_pps_manager = nullptr;
+    QDockWidget *_pps_dock = nullptr;
+    dock::PpsResultDock *_pps_result = nullptr;
+    QPointer<pps::PpsWaveWindow> _pps_wave;
     bool            _is_auto_switch_device;
     high_resolution_clock::time_point _last_key_press_time;
     bool            _is_save_confirm_msg;

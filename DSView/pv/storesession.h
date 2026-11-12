@@ -27,6 +27,7 @@
 #include <string>
 #include <thread>  
 #include <QObject>
+#include <QFileInfo>
 #include <libsigrok.h> 
 
 #include "interface/icallbacks.h"
@@ -83,6 +84,12 @@ public:
 
     inline QString GetFileName(){
         return _file_name;
+    }
+
+    // Used by the auto-save manager to set a full path without a dialog.
+    inline void set_file_name(const QString &name){
+        _file_name = name;
+        _suffix = QFileInfo(name).suffix();
     }
 
     bool IsLogicDataType();

@@ -1223,6 +1223,7 @@ struct DSL_context {
 	unsigned int num_transfers;
 	struct libusb_transfer **transfers;
 	int *usbfd;
+    gboolean dummy_source; /* no usb poll fds available, a timed source drives the event loop */
 
     int pipe_fds[2];
     GIOChannel *channel;

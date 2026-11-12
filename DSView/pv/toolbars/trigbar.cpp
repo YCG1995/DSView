@@ -47,7 +47,8 @@ TrigBar::TrigBar(SigSession *session, QWidget *parent) :
     _measure_button(this),
     _search_button(this),
     _function_button(this),
-    _setting_button(this)
+    _setting_button(this),
+    _pps_button(this)
 {
     _enable = true;
 
@@ -93,6 +94,15 @@ TrigBar::TrigBar(SigSession *session, QWidget *parent) :
     _setting_button.setPopupMode(QToolButton::InstantPopup);
     _setting_button.setMenu(_display_menu);
 
+    // The PPS button is a plain toggle now: it shows or hides the result
+    // window. Start/stop/config/calibration all live inside that window as
+    // icon buttons, so there is no PPS drop-down menu any more.
+    _pps_button.setText("PPS");
+    _pps_button.setToolTip(QString::fromUtf8("显示或隐藏 1PPS 测量结果窗口"));
+    _pps_button.setObjectName("ppsToolButton");
+    _pps_button.setCheckable(true);
+    _pps_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+
     _trig_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
     _protocol_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
     _measure_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
@@ -108,6 +118,7 @@ TrigBar::TrigBar(SigSession *session, QWidget *parent) :
     _search_action = addWidget(&_search_button);
     _function_action = addWidget(&_function_button); 
     _display_action = addWidget(&_setting_button); //must be created
+    _pps_action = addWidget(&_pps_button);
 
     connect(&_trig_button, SIGNAL(clicked()),this, SLOT(trigger_clicked()));
     connect(&_protocol_button, SIGNAL(clicked()),this, SLOT(protocol_clicked()));
@@ -120,6 +131,7 @@ TrigBar::TrigBar(SigSession *session, QWidget *parent) :
     connect(_dark_style, SIGNAL(triggered()), this, SLOT(on_actionDark_triggered()));
     connect(_light_style, SIGNAL(triggered()), this, SLOT(on_actionLight_triggered()));
     connect(_action_dispalyOptions, SIGNAL(triggered()), this, SLOT(on_display_setting()));
+    connect(&_pps_button, &QToolButton::toggled, this, &TrigBar::sig_pps_result);
 
     ADD_UI(this);
 }
@@ -149,6 +161,18 @@ void TrigBar::retranslateUi()
     _action_math->setText(L_S(STR_PAGE_TOOLBAR, S_ID(IDS_TOOLBAR_FUNCTION_MATH), "Math"));
 
     _action_dispalyOptions->setText(L_S(STR_PAGE_TOOLBAR, S_ID(IDS_TOOLBAR_DISPLAY_OPTIONS), "Options"));
+
+    _pps_button.setText("PPS");
+    _pps_button.setToolTip(QString::fromUtf8("显示或隐藏 1PPS 测量结果窗口"));
+}
+
+void TrigBar::set_pps_result_checked(bool visible)
+{
+    if (_pps_button.isChecked() == visible)
+        return;
+    const bool blocked = _pps_button.blockSignals(true);
+    _pps_button.setChecked(visible);
+    _pps_button.blockSignals(blocked);
 }
 
 void TrigBar::reStyle()
@@ -161,6 +185,7 @@ void TrigBar::reStyle()
     _search_button.setIcon(QIcon(iconPath+"/search-bar.svg"));
     _function_button.setIcon(QIcon(iconPath+"/function.svg"));
     _setting_button.setIcon(QIcon(iconPath+"/display.svg"));
+    _pps_button.setIcon(QIcon(iconPath+"/function.svg"));
 
     _action_fft->setIcon(QIcon(iconPath+"/fft.svg"));
     _action_math->setIcon(QIcon(iconPath+"/math.svg"));
@@ -237,6 +262,7 @@ void TrigBar::reload()
         _measure_action->setVisible(true);
         _search_action->setVisible(true);
         _function_action->setVisible(false);
+        _pps_action->setVisible(true);
         _action_lissajous->setVisible(false);
         _action_dispalyOptions->setVisible(true);
 
@@ -246,6 +272,7 @@ void TrigBar::reload()
         _measure_action->setVisible(true);
         _search_action->setVisible(false);
         _function_action->setVisible(false);
+        _pps_action->setVisible(false);
         _action_lissajous->setVisible(false);
         _action_dispalyOptions->setVisible(true);
 
@@ -255,6 +282,7 @@ void TrigBar::reload()
         _measure_action->setVisible(true);
         _search_action->setVisible(false);
         _function_action->setVisible(true);
+        _pps_action->setVisible(false);
         _action_lissajous->setVisible(true);
         _action_dispalyOptions->setVisible(true);
     }
@@ -340,6 +368,7 @@ void TrigBar::on_actionLissajous_triggered()
     _search_button.setEnabled(bEnable);
     _function_button.setEnabled(bEnable);
     _setting_button.setEnabled(bEnable);
+    _pps_button.setEnabled(true); // Stop must remain available while running
 
     if (_session->is_working() && _session->get_device()->get_work_mode() == DSO){
         if (_session->is_instant() == false){

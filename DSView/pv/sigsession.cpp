@@ -25,6 +25,8 @@
 #include "sigsession.h"
 #include "mainwindow.h"
 
+#include <algorithm>
+
 #include "data/analogsnapshot.h"
 #include "data/dsosnapshot.h"
 #include "data/logicsnapshot.h"
@@ -48,6 +50,9 @@
 #include <sys/stat.h>
 #include <map>
 #include <QString>
+#include <QDir>
+#include <QDirIterator>
+#include <QMap>
 
 #include "data/decode/decoderstatus.h"
 #include "dsvdef.h"
@@ -106,6 +111,7 @@ namespace pv
         _is_task_end = false;
         _capture_work_time = 0;
 
+        _data_list.push_back(new SessionData());
         _data_list.push_back(new SessionData());
         _data_list.push_back(new SessionData());
         _view_data = _data_list[0];
@@ -550,8 +556,10 @@ namespace pv
         clear_all_decode_task2();
         clear_decode_result(); 
         
-        _capture_data->clear();
-        _view_data->clear();       
+        if (!_capture_data->is_saving())
+            _capture_data->clear();
+        if (!_view_data->is_saving())
+            _view_data->clear();       
         _is_stream_mode = false;
         _capture_times = 0;
         _dso_packet_count = 0;
@@ -703,15 +711,45 @@ namespace pv
 
         // Set the buffer to store the captured data
         if (bSwapBuffer){
-            int buf_index = 0;
+            int view_index = 0;
             for(int i=0; i<(int)_data_list.size(); i++){
                 if (_data_list[i] == _view_data){
-                    buf_index = i;
+                    view_index = i;
                     break;
                 }
             }
 
-            buf_index = (buf_index + 1) % 2;
+            // Pick a buffer that is neither the current view buffer nor
+            // occupied by a background auto-save. With three buffers the
+            // next capture virtually always gets a free buffer.
+            int buf_index = -1;
+            for(int tries=0; tries<200 && buf_index<0; tries++)
+            {
+                for(int i=0; i<(int)_data_list.size(); i++){
+                    if (i != view_index && !_data_list[i]->is_saving()){
+                        buf_index = i;
+                        break;
+                    }
+                }
+
+                if (buf_index < 0){
+                    // All non-view buffers are being saved: wait briefly for
+                    // one to finish instead of dropping a frame.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            }
+
+            if (buf_index < 0){
+                // Fallback (should not happen in practice): reuse the
+                // non-view buffer that is not currently being written.
+                for(int i=0; i<(int)_data_list.size(); i++){
+                    if (i != view_index){
+                        buf_index = i;
+                        break;
+                    }
+                }
+            }
+
             _capture_data = _data_list[buf_index];
             _capture_data->clear();
 
@@ -1924,6 +1962,118 @@ namespace pv
         trace->decoder()->stop_decode_work();
     }
 
+    QString SigSession::reload_decoder_scripts()
+    {
+        const QString script_dir = GetDecodeScriptDir();
+        if (script_dir.isEmpty())
+            return "Decoder directory not found.";
+
+        // Fingerprint each package with the mtime of its newest script file.
+        QMap<QString, QDateTime> current;
+        const QDir root(script_dir);
+
+        for (const QFileInfo &pkg : root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot))
+        {
+            QDateTime latest;
+            QDirIterator it(pkg.absoluteFilePath(), QDir::Files,
+                            QDirIterator::Subdirectories);
+
+            while (it.hasNext()) {
+                it.next();
+                const QDateTime t = it.fileInfo().lastModified();
+                if (!latest.isValid() || t > latest)
+                    latest = t;
+            }
+
+            current[pkg.fileName()] = latest;
+        }
+
+        // First call: establish the baseline, nothing to reload yet.
+        if (_script_baseline.isEmpty()) {
+            _script_baseline = current;
+            return QString("Baseline established for %1 decoder packages. "
+                           "Edit a script and click again to reload it.").arg(current.size());
+        }
+
+        QStringList changed;
+        for (auto it = current.begin(); it != current.end(); ++it) {
+            const QDateTime base = _script_baseline.value(it.key());
+            if (!base.isValid() || base != it.value())
+                changed.push_back(it.key());
+        }
+
+        if (changed.isEmpty())
+            return "No decoder scripts have changed.";
+
+        // Stop the decode thread and clear the pending queue.
+        {
+            std::lock_guard<std::mutex> lock(_decode_task_mutex);
+            for (auto trace : _decode_tasks)
+                trace->decoder()->stop_decode_work();
+            _decode_tasks.clear();
+        }
+        for (auto trace : _decode_traces)
+            trace->decoder()->stop_decode_work();
+        if (_decode_thread.joinable())
+            _decode_thread.join();
+
+        // Capture each affected Decoder's id and probe bindings before the
+        // C reload frees the old srd_decoder / srd_channel objects.
+        std::map<data::decode::Decoder*, QString> dec_id;
+        std::map<data::decode::Decoder*, std::map<std::string, int>> saved;
+
+        for (auto trace : _decode_traces) {
+            for (auto dec : trace->decoder()->stack()) {
+                const QString modname = QString::fromStdString(dec->module_name());
+                if (changed.contains(modname)) {
+                    dec_id[dec] = modname;
+                    saved[dec] = dec->export_probe_ids();
+                }
+            }
+        }
+
+        // Re-import only the changed packages.
+        for (const QString &id : changed) {
+            const QByteArray b = id.toUtf8();
+            const int rc = srd_decoder_reload(b.constData());
+            if (rc != SRD_OK)
+                return "Failed to reload decoder: " + id;
+        }
+
+        // Attach the new handles and remap probe bindings.
+        for (auto &kv : saved) {
+            data::decode::Decoder *dec = kv.first;
+            const QByteArray b = dec_id[dec].toUtf8();
+            const srd_decoder *nd = srd_decoder_get_by_module_name(b.constData());
+            if (!nd)
+                return "Reloaded decoder missing: " + dec_id[dec];
+            dec->attach_decoder(nd, kv.second);
+        }
+
+        _script_baseline = current;
+
+        // Re-decode every trace against the current data.
+        for (auto trace : _decode_traces) {
+            trace->decoder()->set_options_changed(true);
+            add_decode_task(trace);
+        }
+
+        return QString("Reloaded %1 decoder(s): %2. Re-decoding...")
+                .arg(changed.size()).arg(changed.join(", "));
+    }
+
+    void SigSession::re_decode_trace(int index)
+    {
+        for (size_t i = 0; i < _decode_traces.size(); ++i) {
+            if (index >= 0 && static_cast<int>(i) != index)
+                continue;
+
+            view::DecodeTrace *trace = _decode_traces[i];
+            trace->decoder()->set_options_changed(true);
+            add_decode_task(trace);
+        }
+    }
+
     void SigSession::clear_all_decoder(bool bUpdateView)
     {
         if (_decode_traces.empty())
@@ -2156,6 +2306,12 @@ namespace pv
         _msg_listeners.push_back(ln);
     }
 
+    void SigSession::remove_msg_listener(IMessageListener *ln)
+    {
+        _msg_listeners.erase(std::remove(_msg_listeners.begin(),
+            _msg_listeners.end(), ln), _msg_listeners.end());
+    }
+
     void SigSession::broadcast_msg(int msg)
     {
         for (IMessageListener *cb : _msg_listeners)
@@ -2292,16 +2448,24 @@ namespace pv
                     //Switch the caputrued data buffer to view.
                     if (bSwapBuffer)
                     {
-                        if (_view_data != _capture_data)
-                            _view_data->clear();
-                        
-                        _view_data = _capture_data; 
-                        attach_data_to_signal(_view_data); 
+                        if (_view_data != _capture_data){
+                            // A buffer still being auto-saved must not be cleared.
+                            if (!_view_data->is_saving())
+                                _view_data->clear();
+                        }
+
+                        _view_data = _capture_data;
+                        attach_data_to_signal(_view_data);
                         set_session_time(_trig_time);
 
                         _callback->receive_trigger(_view_data->_trig_pos); //Update trig position.
 
                         _callback->trigger_message(DSV_MSG_DATA_POOL_CHANGED);
+
+                        // Repeat mode: auto-save this frame in the background
+                        // without blocking the next trigger.
+                        if (is_repeat_mode() && _is_working)
+                            _callback->auto_save_frame();
                     }
 
                     for (auto de : _decode_traces)
@@ -2487,6 +2651,29 @@ namespace pv
     {
         _view_data->clear();
         data_updated();
+    }
+
+    SessionData* SigSession::auto_save_claim_view()
+    {
+        SessionData *data = _view_data;
+        data->mark_saving();
+        return data;
+    }
+
+    void SigSession::auto_save_release(SessionData *data)
+    {
+        if (data != NULL)
+            data->clear_saving();
+    }
+
+    int SigSession::auto_save_active_count() const
+    {
+        int n = 0;
+        for (auto p : _data_list){
+            if (p->is_saving())
+                n++;
+        }
+        return n;
     }
 
     void SigSession::set_trace_name(view::Trace *trace, QString name)

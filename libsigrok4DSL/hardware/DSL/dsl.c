@@ -30,6 +30,16 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "dsl: "
 
+/* Per-frame transfer timing: set when the first data packet of a capture
+ * arrives, cleared when that frame is complete. */
+static gint64 s_frame_t0 = 0;
+static double s_frame_ms = 0.0;
+
+SR_API double ds_last_frame_transfer_ms(void)
+{
+    return s_frame_ms;
+}
+
 SR_PRIV int dsl_secuReset(const struct sr_dev_inst *sdi);
 SR_PRIV int dsl_secuWrite(const struct sr_dev_inst *sdi, uint16_t cmd, uint16_t din);
 SR_PRIV gboolean dsl_isSecuReady(const struct sr_dev_inst *sdi);
@@ -2113,7 +2123,23 @@ static size_t get_buffer_size(const struct sr_dev_inst *sdi)
     if (sdi->mode == DSO) {
         s = (devc->instant) ? devc->profile->dev_caps.dso_depth : devc->actual_samples * dsl_en_ch_num(sdi) + dsl_header_size(devc);
     } else {
-        s = (devc->stream) ? get_single_buffer_time(devc) * to_bytes_per_ms(devc) : 1024*1024;
+        if (devc->stream) {
+            s = get_single_buffer_time(devc) * to_bytes_per_ms(devc);
+        } else {
+            /* Buffer mode: the readout chunk size can be tuned from the
+             * environment so the USB throughput can be measured. */
+            const char *env = getenv("DSVIEW_DSL_BUF_KB");
+            long kb = env ? strtol(env, NULL, 10) : 0;
+            if (kb > 0)
+                s = (size_t)kb * 1024;
+            else if (sdi->mode == LOGIC)
+                /* 2 MB chunks: a 10 MB fresh frame then arrives in ~245 ms
+                 * (about 42 MB/s). The long standing 1 MB / 4 in flight
+                 * combination measured ~307 ms for the same frame. */
+                s = 2048 * 1024;
+            else
+                s = 1024 * 1024;
+        }
     }
 
     if (devc->profile->usb_speed == LIBUSB_SPEED_SUPER)
@@ -2135,6 +2161,19 @@ static unsigned int get_number_of_transfers(const struct sr_dev_inst *sdi)
     n = (devc->stream) ? ceil(get_total_buffer_time(devc) * 1.0f * to_bytes_per_ms(devc) / get_buffer_size(sdi)) :
         (devc->profile->usb_speed == LIBUSB_SPEED_SUPER) ? 16 : 4;
     #endif
+
+    /* Buffer mode: allow the number of in-flight readout transfers to be
+     * tuned from the environment as well. One transfer at a time is the fast
+     * path for logic readout: every additional queued 1 MB transfer measured
+     * ~50 ms slower per 10 MB frame. */
+    if (!devc->stream) {
+        const char *env = getenv("DSVIEW_DSL_NTRANS");
+        long cnt = env ? strtol(env, NULL, 10) : 0;
+        if (cnt > 0)
+            n = (unsigned int)cnt;
+        else if (sdi->mode == LOGIC)
+            n = 1;
+    }
 
     if (n > NUM_SIMUL_TRANSFERS)
         return NUM_SIMUL_TRANSFERS;
@@ -2161,6 +2200,16 @@ SR_PRIV unsigned int dsl_get_timeout(const struct sr_dev_inst *sdi)
 static void finish_acquisition(struct DSL_context *devc)
 {
     struct sr_datafeed_packet packet;
+
+    /* How long the frame took to come over: from the first data packet of this
+     * capture to now. Exposed through ds_last_frame_transfer_ms() so the 1PPS
+     * view can report the per-frame capture + upload timing. */
+    if (s_frame_t0 != 0) {
+        s_frame_ms = (double)(g_get_monotonic_time() - s_frame_t0) / 1000.0;
+        s_frame_t0 = 0;
+        sr_info("frame transfer: complete in %.1f ms from first data packet",
+            s_frame_ms);
+    }
 
     sr_info("%s: send SR_DF_END packet", __func__);
     /* Terminate session. */
@@ -2317,8 +2366,11 @@ static void receive_transfer(struct libusb_transfer *transfer)
     struct DSL_context *devc = transfer->user_data;
     struct sr_dev_inst *sdi = devc->cb_data;
 
-    if (devc->status == DSL_START)
+    if (devc->status == DSL_START) {
         devc->status = DSL_DATA;
+        /* First packet of this capture: start measuring the transfer time. */
+        s_frame_t0 = g_get_monotonic_time();
+    }
 
     if (devc->abort)
         devc->status = DSL_STOP;
@@ -2474,14 +2526,36 @@ static void receive_header(struct libusb_transfer *transfer)
                 ds_data_forward(sdi, &packet);
 
                 devc->status = DSL_DATA;
+                /* Trigger packet: the frame starts here. Time the rest of the
+                 * frame (capture tail + USB readout) from this moment. */
+                s_frame_t0 = g_get_monotonic_time();
             }
         }
     } else if (!devc->abort) {
-        sr_err("%s: trigger packet data error.", __func__);
-        packet.type = SR_DF_TRIGGER;
-        packet.payload = trigger_pos;
-        packet.status = SR_PKT_DATA_ERROR;
-        ds_data_forward(sdi, &packet);
+        if (transfer->status == LIBUSB_TRANSFER_CANCELLED ||
+            (transfer->status == LIBUSB_TRANSFER_COMPLETED &&
+             transfer->actual_length == 0)) {
+            /*
+             * A cancelled or empty completion is what a trigger transfer from
+             * an already stopped capture looks like late in the event queue
+             * (or a device which was just re-armed and has not delivered its
+             * header yet). That is teardown noise, not a data format error:
+             * forwarding SR_PKT_DATA_ERROR for it pops "Packet Error" in the
+             * GUI and aborts the following capture (fatal for the 1PPS loop).
+             */
+            sr_info("%s: ignoring stale trigger transfer (status %d, length %d).",
+                    __func__, transfer->status, transfer->actual_length);
+        }
+        else {
+            sr_err("%s: trigger packet data error: status %d, check_id 0x%08x"
+                   " (expect 0x%08x), length %d (expect %d).",
+                   __func__, transfer->status, trigger_pos->check_id,
+                   TRIG_CHECKID, transfer->actual_length, dsl_header_size(devc));
+            packet.type = SR_DF_TRIGGER;
+            packet.payload = trigger_pos;
+            packet.status = SR_PKT_DATA_ERROR;
+            ds_data_forward(sdi, &packet);
+        }
     }
 
     free_transfer(transfer, 1);
@@ -2503,6 +2577,8 @@ SR_PRIV int dsl_start_transfers(const struct sr_dev_inst *sdi)
 
     num_transfers = get_number_of_transfers(sdi);
     size = get_buffer_size(sdi);
+    sr_info("%s: submitting %u data transfer(s) of %u bytes each (actual_bytes %" G_GUINT64_FORMAT ", stream %d)",
+            __func__, num_transfers, (unsigned int)size, (uint64_t)devc->actual_bytes, devc->stream);
 
     /* trigger packet transfer */
     if (!(trigger_pos = g_try_malloc0(dsl_header_size(devc)))) {
@@ -2556,6 +2632,7 @@ SR_PRIV int dsl_start_transfers(const struct sr_dev_inst *sdi)
         devc->num_transfers++;
     }
 
+    sr_info("%s: all %u usb transfer(s) submitted", __func__, devc->num_transfers);
     return SR_OK;
 }
 

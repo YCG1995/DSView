@@ -20,6 +20,9 @@
 
 
 #include "../../libsigrok-internal.h"
+#ifdef __ANDROID__
+#include "../../android_usb_bridge.h"
+#endif
 
 #include "dsl.h"
 #include "command.h"
@@ -315,6 +318,25 @@ static GSList *scan(GSList *options)
     
     libusb_get_device_list(drvc->sr_ctx->libusb_ctx, &devlist);
     
+#ifdef __ANDROID__
+    /*
+     * Android 上 libusb 没有 /dev/bus/usb 权限，扫出来的通常是空列表
+     * （也可能直接是 NULL）。两种情况都改走 OTG 桥：
+     * Java 的 UsbManager 打开设备拿 fd → libusb_wrap_sys_device。
+     */
+    if (devlist == NULL || devlist[0] == NULL) {
+        if (devlist != NULL) {
+            libusb_free_device_list(devlist, 0);
+            devlist = NULL;
+        }
+        sr_info("%s: libusb list is empty on Android, trying OTG bridge.", __func__);
+        if (srdv_android_usb_open(DS_VENDOR_ID, 0) == 0) {
+            devlist = srdv_android_usb_scan_list();
+            sr_info("%s: Android OTG device wrapped via fd.", __func__);
+        }
+    }
+#endif
+
     if (devlist == NULL){
         sr_info("%s: Failed to call libusb_get_device_list(), it returns a null list.", __func__);
         return NULL;
@@ -349,6 +371,16 @@ static GSList *scan(GSList *options)
             continue;
 
         usb_speed = libusb_get_device_speed(device_handle);
+#ifdef __ANDROID__
+        /*
+         * 通过 libusb_wrap_sys_device 拿到的设备查不到 USB 速度
+         * （返回 LIBUSB_SPEED_UNKNOWN），而 DSLogic 的 profile 是按
+         * HIGH/SUPER 匹配的。U2Pro16 走 USB2 High Speed，
+         * 这里把 UNKNOWN 归一成 HIGH，避免设备被"速度不匹配"过滤掉。
+         */
+        if (usb_speed == LIBUSB_SPEED_UNKNOWN || usb_speed == LIBUSB_SPEED_FULL)
+            usb_speed = LIBUSB_SPEED_HIGH;
+#endif
         if ((usb_speed != LIBUSB_SPEED_HIGH) && (usb_speed != LIBUSB_SPEED_SUPER)){
             sr_info("scan(): The idVendor is right, but the usb speed is too low, speed type:%d", usb_speed);
             is_speed_not_match = 1;
@@ -466,6 +498,12 @@ static GSList *scan(GSList *options)
 		}
 	}
 
+#ifdef __ANDROID__
+	/* Android 上这份列表是本地 calloc 出来的，不能交给 libusb 释放 */
+	if (srdv_android_usb_opened())
+		srdv_android_usb_free_scan_list(devlist);
+	else
+#endif
 	libusb_free_device_list(devlist, 0);
 
     if (conn_devices){
@@ -1316,10 +1354,22 @@ static void remove_sources(struct DSL_context *devc)
 {
     int i;
     sr_info("%s: remove fds from polling", __func__);
-    /* Remove fds from polling. */
-    for (i = 0; devc->usbfd[i] != -1; i++)
-        sr_source_remove(devc->usbfd[i]);
-    g_free(devc->usbfd);
+
+    if (devc->dummy_source) {
+        /* Windows backends without pollfds: drop the timed dummy source. */
+        devc->dummy_source = FALSE;
+        sr_source_remove(-1);
+    }
+    else if (devc->usbfd) {
+        /* Remove fds from polling. */
+        for (i = 0; devc->usbfd[i] != -1; i++)
+            sr_source_remove(devc->usbfd[i]);
+    }
+
+    if (devc->usbfd) {
+        g_free(devc->usbfd);
+        devc->usbfd = NULL;
+    }
 }
 
 static void report_overflow(struct DSL_context *devc)
@@ -1351,7 +1401,15 @@ static int receive_data(int fd, int revents, const struct sr_dev_inst *sdi)
     devc = sdi->priv;
     usb = sdi->conn;
 
-    tv.tv_sec = tv.tv_usec = 0;
+    if (devc->dummy_source) {
+        /* No pollfds: this source is called in a tight loop, so block briefly
+         * inside libusb instead of spinning the collect thread. */
+        tv.tv_sec = 0;
+        tv.tv_usec = 10000;
+    }
+    else {
+        tv.tv_sec = tv.tv_usec = 0;
+    }
     libusb_handle_events_timeout_completed(drvc->sr_ctx->libusb_ctx, &tv, &completed);
 
     if (devc->trf_completed)
@@ -1431,10 +1489,39 @@ static int dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
     devc->empty_transfer_count = 0;
     devc->empty_poll_count = 0;
     devc->status = DSL_INIT;
+    devc->dummy_source = FALSE;
+    devc->usbfd = NULL;
     devc->num_transfers = 0;
     devc->submitted_transfers = 0;
     devc->actual_samples = (devc->limit_samples + SAMPLES_ALIGN) & ~SAMPLES_ALIGN;
     devc->actual_bytes = devc->actual_samples / DSLOGIC_ATOMIC_SAMPLES * dsl_en_ch_num(sdi) * DSLOGIC_ATOMIC_SIZE;
+
+    /*
+     * Diagnostic only: keep the upstream capture path untouched. The probe
+     * count vs channel-mode width is reported here so a mismatch shows up in
+     * the log, but no probe is disabled and actual_bytes stays upstream-exact.
+     */
+    {
+        const int mode_ch = channel_modes[devc->ch_mode].num;
+        int enabled_cnt = 0;
+        GSList *l;
+
+        for (l = sdi->channels; l; l = l->next) {
+            struct sr_channel *probe = (struct sr_channel *)l->data;
+            if (probe->type != SR_CHANNEL_LOGIC)
+                continue;
+            if (probe->enabled)
+                enabled_cnt++;
+        }
+
+        sr_info("%s: ch_mode %d (%d channels), enabled logic channels %d, samplerate %" G_GUINT64_FORMAT ", bytes %" G_GUINT64_FORMAT,
+                __func__, devc->ch_mode, mode_ch, dsl_en_ch_num(sdi),
+                (sdi->mode == LOGIC) ? (uint64_t)devc->cur_samplerate : (uint64_t)0,
+                (uint64_t)devc->actual_bytes);
+        if (mode_ch > 0 && enabled_cnt > mode_ch)
+            sr_info("%s: WARNING: %d logic channels enabled but this mode only carries %d.",
+                    __func__, enabled_cnt, mode_ch);
+    }
 	devc->abort = FALSE;
     devc->mstatus_valid = FALSE;
     devc->mstatus.captured_cnt0 = 0;
@@ -1484,23 +1571,49 @@ static int dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
                "(%d)%d", __func__, ret, errno);
         return ret;
     }
+    sr_info("%s: usb transfers submitted", __func__);
 
     /* setup callback function for data transfer */
     lupfd = libusb_get_pollfds(drvc->sr_ctx->libusb_ctx);
-    for (i = 0; lupfd[i]; i++);
 
-    if (!(devc->usbfd = g_try_malloc0(sizeof(struct libusb_pollfd) * (i + 1)))){
-        sr_err("%s,ERROR:failed to alloc memory.", __func__);
-    	return SR_ERR;
-    }
+    if (!lupfd) {
+        /*
+         * The Windows WinUSB backend does not expose pollfds and returns NULL
+         * here. Upstream dereferences the NULL list and dies with 0xC0000005
+         * (or wedges). Instead, keep the libusb event loop alive with a timed
+         * dummy source: the session loop then calls receive_data() repeatedly
+         * and receive_data() pumps libusb events itself.
+         */
+        sr_info("%s: no usb poll fds available, using a timed dummy source", __func__);
 
-    for (i = 0; lupfd[i]; i++) {
-        sr_source_add(lupfd[i]->fd, lupfd[i]->events,
-                  dsl_get_timeout(sdi), receive_data, sdi);
-        devc->usbfd[i] = lupfd[i]->fd;
+        if (!(devc->usbfd = g_try_malloc0(sizeof(int) * 2))) {
+            sr_err("%s,ERROR:failed to alloc memory.", __func__);
+            return SR_ERR_MALLOC;
+        }
+        devc->usbfd[0] = -1;
+        devc->usbfd[1] = -1;
+        devc->dummy_source = TRUE;
+
+        sr_source_add(-1, 0, dsl_get_timeout(sdi), receive_data, sdi);
+        sr_info("%s: usb poll fds registered (dummy)", __func__);
     }
-    devc->usbfd[i] = -1;
-    g_free(lupfd);
+    else {
+        for (i = 0; lupfd[i]; i++);
+
+        if (!(devc->usbfd = g_try_malloc0(sizeof(struct libusb_pollfd) * (i + 1)))){
+            sr_err("%s,ERROR:failed to alloc memory.", __func__);
+            return SR_ERR;
+        }
+
+        for (i = 0; lupfd[i]; i++) {
+            sr_source_add(lupfd[i]->fd, lupfd[i]->events,
+                      dsl_get_timeout(sdi), receive_data, sdi);
+            devc->usbfd[i] = lupfd[i]->fd;
+        }
+        devc->usbfd[i] = -1;
+        g_free(lupfd);
+        sr_info("%s: usb poll fds registered (%d)", __func__, i);
+    }
 
     wr_cmd.header.dest = DSL_CTL_START;
     wr_cmd.header.size = 0;
@@ -1510,10 +1623,12 @@ static int dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
         return ret;
     }
     devc->status = DSL_START;
+    sr_info("%s: DSL_CTL_START sent", __func__);
 
 	/* Send header packet to the session bus. */
     //std_session_send_df_header(cb_data, LOG_PREFIX);
     std_session_send_df_header(sdi, LOG_PREFIX);
+    sr_info("%s: df header sent", __func__);
 
     return SR_OK;
 }

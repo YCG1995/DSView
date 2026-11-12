@@ -184,6 +184,7 @@ static void decoder_free(struct srd_decoder *dec)
 	g_free(dec->longname);
 	g_free(dec->name);
 	g_free(dec->id);
+	g_free(dec->module_name);
 
 	g_free(dec);
 }
@@ -758,6 +759,9 @@ SRD_API int srd_decoder_load(const char *module_name)
 
 	fail_txt = NULL;
 
+	// Remember the package / directory name for later selective reload.
+	d->module_name = g_strdup(module_name);
+
 	//Load module from python script file,module_name is a sub directory
 	d->py_mod = py_import_by_name(module_name);
 	if (!d->py_mod) {
@@ -1167,6 +1171,136 @@ SRD_API int srd_decoder_unload_all(void)
 	pd_list = NULL;
 
 	return SRD_OK;
+}
+
+/**
+ * Reload a single protocol decoder from its (possibly modified) script files.
+ *
+ * The decoder module and all of its submodules are purged from sys.modules so
+ * the import does not return a cached module, then the decoder is unloaded and
+ * freshly imported. Like srd_decoder_unload(), this frees all decoder
+ * instances in every session; the frontend must rebuild instances afterwards.
+ *
+ * @param[in] id The decoder id (directory name), e.g. "1-i2c".
+ *
+ * @return SRD_OK upon success, a (negative) error code otherwise.
+ */
+/*
+ * Locate a loaded decoder by its Python module (package / directory) name.
+ * The decoder's logical id (srd_decoder->id, e.g. "0:i2c") differs from its
+ * package name (e.g. "0-i2c"), so it cannot be looked up via get_by_id.
+ * Must be called while holding the GIL.
+ */
+static struct srd_decoder *get_decoder_by_module_name(const char *module_name)
+{
+	GSList *l;
+
+	for (l = pd_list; l; l = l->next) {
+		struct srd_decoder *d = l->data;
+
+		if (d->module_name && strcmp(d->module_name, module_name) == 0)
+			return d;
+	}
+
+	return NULL;
+}
+
+SRD_API struct srd_decoder *srd_decoder_get_by_module_name(
+		const char *module_name)
+{
+	struct srd_decoder *dec;
+	PyGILState_STATE gstate;
+
+	if (!srd_check_init() || !module_name)
+		return NULL;
+
+	gstate = PyGILState_Ensure();
+	dec = get_decoder_by_module_name(module_name);
+	PyGILState_Release(gstate);
+
+	return dec;
+}
+
+SRD_API int srd_decoder_reload(const char *module_name)
+{
+	struct srd_decoder *dec;
+	PyGILState_STATE gstate;
+	PyObject *modules, *keys;
+	Py_ssize_t i, n;
+	char *prefix;
+	size_t namelen;
+	int purged = 0, ret;
+
+	if (!srd_check_init())
+		return SRD_ERR;
+	if (!module_name)
+		return SRD_ERR_ARG;
+
+	namelen = strlen(module_name);
+	prefix = g_strdup_printf("%s.", module_name);
+
+	gstate = PyGILState_Ensure();
+
+	dec = get_decoder_by_module_name(module_name);
+	if (!dec) {
+		srd_err("reload: module '%s' not found in loaded list.",
+			module_name);
+		g_free(prefix);
+		PyGILState_Release(gstate);
+		return SRD_ERR_ARG;
+	}
+	srd_err("reload: begin for module '%s', purging sys.modules.",
+		module_name);
+
+	/* Remove the package and all its submodules from sys.modules. */
+	modules = PyImport_GetModuleDict();
+	keys = PyDict_Keys(modules);
+	n = PyList_Size(keys);
+
+	for (i = 0; i < n; i++) {
+		PyObject *key = PyList_GetItem(keys, i);
+		PyObject *k_bytes = PyUnicode_AsUTF8String(key);
+
+		if (!k_bytes) {
+			PyErr_Clear();
+			continue;
+		}
+
+		const char *k = PyBytes_AsString(k_bytes);
+
+		if (!k) {
+			Py_DECREF(k_bytes);
+			PyErr_Clear();
+			continue;
+		}
+
+		if (strcmp(k, module_name) == 0 ||
+		    strncmp(k, prefix, namelen + 1) == 0) {
+			if (PyDict_DelItem(modules, key) == -1)
+				PyErr_Clear();
+			else
+				purged++;
+		}
+
+		Py_DECREF(k_bytes);
+	}
+
+	Py_DECREF(keys);
+	g_free(prefix);
+	srd_err("reload: purged %d sys.modules entries.", purged);
+	PyGILState_Release(gstate);
+
+	/* Unload (frees all instances globally) and re-import. */
+	ret = srd_decoder_unload(dec);
+	if (ret != SRD_OK) {
+		srd_err("reload: srd_decoder_unload returned %d.", ret);
+		return ret;
+	}
+	srd_err("reload: unloaded, now re-importing.");
+
+	ret = srd_decoder_load(module_name);
+	srd_err("reload: srd_decoder_load returned %d.", ret);
+	return ret;
 }
 
 /** @} */

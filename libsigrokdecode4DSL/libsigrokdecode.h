@@ -211,6 +211,9 @@ struct srd_decoder {
 
 	/** sigrokdecode.Decoder class. */
 	void *py_dec;
+
+	/** Python package / directory name (e.g. "0-i2c"), used for reload. */
+	char *module_name;
 };
 
 enum srd_initial_pin {
@@ -396,6 +399,12 @@ SRD_API char *srd_decoder_doc_get(const struct srd_decoder *dec);
 SRD_API int srd_decoder_unload(struct srd_decoder *dec);
 SRD_API int srd_decoder_load_all(void);
 SRD_API int srd_decoder_unload_all(void);
+SRD_API struct srd_decoder *srd_decoder_get_by_module_name(const char *name);
+SRD_API int srd_decoder_reload(const char *id);
+
+/* srd.c - captured stdout/stderr from decoder scripts. */
+SRD_API char *srd_console_take(int do_clear);
+SRD_API void srd_console_clear(void);
 
 /* instance.c */
 SRD_API int srd_inst_option_set(struct srd_decoder_inst *di,

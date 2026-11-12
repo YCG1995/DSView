@@ -44,6 +44,7 @@ public:
     virtual void receive_header()=0;
     virtual void trigger_message(int msg)=0;  
     virtual void delay_prop_msg(QString strMsg)=0;
+    virtual void auto_save_frame()=0;
 };
 
 class ISessionDataGetter

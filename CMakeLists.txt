@@ -23,6 +23,16 @@ cmake_minimum_required(VERSION 2.8.6)
 
 project(DSView)
 
+# Upstream release builds define NDEBUG, which turns the many assert() calls
+# into no-ops. Without NDEBUG a failed assert pops up a native assertion dialog
+# *on the collect thread*; that thread then blocks forever inside the dialog,
+# and the GUI thread waits for it in ds_stop_collect() -> the window freezes
+# completely. Keep the release semantics for any non-Debug build.
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+	add_definitions(-DNDEBUG)
+endif()
+
+
 #===============================================================================
 #= Config Header
 #-------------------------------------------------------------------------------
@@ -30,9 +40,9 @@ project(DSView)
 set(DS_TITLE DSView)
 set(DS_DESCRIPTION "A GUI for instruments of DreamSourceLab")
 
-set(DS_VERSION_MAJOR 1)
-set(DS_VERSION_MINOR 3)
-set(DS_VERSION_MICRO 2)
+set(DS_VERSION_MAJOR 2)
+set(DS_VERSION_MINOR 0)
+set(DS_VERSION_MICRO 1)
 set(DS_VERSION_STRING  ${DS_VERSION_MAJOR}.${DS_VERSION_MINOR}.${DS_VERSION_MICRO})
 
 configure_file (
@@ -109,26 +119,56 @@ link_directories(${GLIB_LIBDIR})
 #= python3
 #-------------------------------------------------------------------------------
 
-find_package(Python3 COMPONENTS Development QUIET)
-
-if (Python3_FOUND)
-	message("----- python3:")
-	message(STATUS "	 includes:" ${Python3_INCLUDE_DIRS})
-	message(STATUS "	 libraries:" ${Python3_LIBRARIES})
-	include_directories(${Python3_INCLUDE_DIRS})
-	set(PY_LIB ${Python3_LIBRARIES})
+if(ANDROID)
+	# Android 分支：CPython for Android 尚未嵌入，先不链接 Python，并把
+	# libsigrokdecode4DSL 的源码从目标里去掉（见下方 add_executable 前）。
+	# 嵌入 CPython 之后把 DSVIEW_ANDROID_PYTHON 打开即可恢复解码器能力。
+	option(DSVIEW_ANDROID_PYTHON "Link CPython for Android (decode support)" OFF)
+	# 交叉编译好的 CPython for Android 前缀（include/ + lib/libpython3.x.a|so）
+	set(DSVIEW_ANDROID_PY_INCLUDE "" CACHE PATH "CPython-for-Android include dir")
+	set(DSVIEW_ANDROID_PY_LIB "" CACHE FILEPATH "libpython for Android")
+	if(DSVIEW_ANDROID_PYTHON)
+		if(DSVIEW_ANDROID_PY_INCLUDE AND DSVIEW_ANDROID_PY_LIB)
+			include_directories(${DSVIEW_ANDROID_PY_INCLUDE})
+			set(PY_LIB ${DSVIEW_ANDROID_PY_LIB})
+			message("----- python3(android): ${DSVIEW_ANDROID_PY_LIB}")
+		else()
+			find_package(Python3 COMPONENTS Development REQUIRED)
+			include_directories(${Python3_INCLUDE_DIRS})
+			set(PY_LIB ${Python3_LIBRARIES})
+			message("----- python3(android):" ${Python3_LIBRARIES})
+		endif()
+		# Android 的 CPython 走分离式初始化，屏蔽 Python.h 对 <dlfcn.h>/<pwd.h> 等
+		# 宿主头文件的依赖不成立时的问题；同时 srd.c 里 Py_SetPythonHome 等老 API
+		# 在 3.12+ 已标记弃用，避免 -Werror。
+		add_compile_definitions(DSVIEW_ANDROID_PYTHON_ENABLED)
+	else()
+		message("----- python3: skipped on Android (PCRE2/Qt 采集与 1PPS 不受影响)")
+		set(PY_LIB "")
+		add_compile_definitions(DSVIEW_ANDROID_NO_PYTHON)
+	endif()
 else()
-     find_package(PythonLibs 3 QUIET)
+	find_package(Python3 COMPONENTS Development QUIET)
 
-     if(PYTHONLIBS_FOUND)
-     	message("----- python(${PYTHONLIBS_VERSION_STRING}):")
-	message(STATUS "	 includes:" ${PYTHON_INCLUDE_DIRS})
-	message(STATUS "	 libraries:" ${PYTHON_LIBRARIES})
-	include_directories(${PYTHON_INCLUDE_DIRS})
-	set(PY_LIB ${PYTHON_LIBRARIES})
-     else()
-     	message(FATAL_ERROR  "Please install lib python3!")
-     endif()
+	if (Python3_FOUND)
+		message("----- python3:")
+		message(STATUS "	 includes:" ${Python3_INCLUDE_DIRS})
+		message(STATUS "	 libraries:" ${Python3_LIBRARIES})
+		include_directories(${Python3_INCLUDE_DIRS})
+		set(PY_LIB ${Python3_LIBRARIES})
+	else()
+	     find_package(PythonLibs 3 QUIET)
+
+	     if(PYTHONLIBS_FOUND)
+	     	message("----- python(${PYTHONLIBS_VERSION_STRING}):")
+		message(STATUS "	 includes:" ${PYTHON_INCLUDE_DIRS})
+		message(STATUS "	 libraries:" ${PYTHON_LIBRARIES})
+		include_directories(${PYTHON_INCLUDE_DIRS})
+		set(PY_LIB ${PYTHON_LIBRARIES})
+	     else()
+	     	message(FATAL_ERROR  "Please install lib python3!")
+	     endif()
+	endif()
 endif()
   
 #===============================================================================
@@ -182,14 +222,20 @@ find_package(Qt5Core QUIET)
 if(Qt5Core_FOUND)
 	message("----- Qt5:")
 	message(STATUS "	 includes:" ${Qt5Core_INCLUDE_DIRS})
-	#find_package(Qt5WinExtras REQUIRED)
 	find_package(Qt5Widgets REQUIRED)
 	find_package(Qt5Gui REQUIRED)
+	# Network is used by the embedded MCP HTTP server.
+	find_package(Qt5Network REQUIRED)
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${Qt5Widgets_EXECUTABLE_COMPILE_FLAGS}")
-	#set(QT_INCLUDE_DIRS ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS} ${Qt5WinExtras_INCLUDE_DIRS})
-	#set(QT_LIBRARIES Qt5::Gui Qt5::Widgets Qt5::WinExtras)
-	set(QT_INCLUDE_DIRS ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS})
-	set(QT_LIBRARIES Qt5::Gui Qt5::Widgets)
+	if(WIN32)
+		# QWinTaskbarButton / QWinTaskbarProgress are used on Windows.
+		find_package(Qt5WinExtras REQUIRED)
+		set(QT_INCLUDE_DIRS ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS} ${Qt5Network_INCLUDE_DIRS} ${Qt5WinExtras_INCLUDE_DIRS})
+		set(QT_LIBRARIES Qt5::Gui Qt5::Widgets Qt5::Network Qt5::WinExtras)
+	else()
+		set(QT_INCLUDE_DIRS ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS} ${Qt5Network_INCLUDE_DIRS})
+		set(QT_LIBRARIES Qt5::Gui Qt5::Widgets Qt5::Network)
+	endif()
 	add_definitions(${Qt5Gui_DEFINITIONS} ${Qt5Widgets_DEFINITIONS})
 else()
 	find_package(Qt6Core QUIET)
@@ -200,9 +246,11 @@ if(Qt6Core_FOUND)
 	message(STATUS "	 includes:" ${Qt6Core_INCLUDE_DIRS})
 	find_package(Qt6Widgets REQUIRED)
 	find_package(Qt6Gui REQUIRED)
+	# Network 供内置 MCP HTTP 服务使用（与 Qt5 分支保持一致）
+	find_package(Qt6Network REQUIRED)
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${Qt6Widgets_EXECUTABLE_COMPILE_FLAGS}")
-	set(QT_INCLUDE_DIRS ${Qt6Gui_INCLUDE_DIRS} ${Qt6Widgets_INCLUDE_DIRS})
-	set(QT_LIBRARIES Qt6::Gui Qt6::Widgets)
+	set(QT_INCLUDE_DIRS ${Qt6Gui_INCLUDE_DIRS} ${Qt6Widgets_INCLUDE_DIRS} ${Qt6Network_INCLUDE_DIRS})
+	set(QT_LIBRARIES Qt6::Gui Qt6::Widgets Qt6::Network)
 	add_definitions(${Qt6Gui_DEFINITIONS} ${Qt6Widgets_DEFINITIONS})
 endif()
 
@@ -291,6 +339,16 @@ set(DSView_SOURCES
     DSView/pv/prop/string.cpp
     DSView/pv/dialogs/storeprogress.cpp
     DSView/pv/storesession.cpp
+    DSView/pv/autosavemanager.cpp
+    DSView/pv/mcp/mcpserver.cpp
+    DSView/pv/pps/ppsdecoder.cpp
+    DSView/pv/pps/ppscalibration.cpp
+    DSView/pv/pps/ppsmanager.cpp
+    DSView/pv/pps/ppswriter.cpp
+    DSView/pv/pps/ppswavewindow.cpp
+    DSView/pv/dialogs/ppsconfigdlg.cpp
+    DSView/pv/dialogs/ppscalibdlg.cpp
+    DSView/pv/dock/ppsresultdock.cpp
     DSView/pv/view/devmode.cpp
     DSView/pv/dialogs/waitingdialog.cpp
     DSView/pv/dialogs/dsomeasure.cpp
@@ -353,6 +411,8 @@ set(DSView_SOURCES
     DSView/pv/ui/popupdlglist.cpp
     DSView/pv/ui/xspinbox.cpp
     DSView/pv/ui/xprogressbar.cpp
+DSView/pv/winnativewidget.cpp
+DSView/pv/winshadow.cpp
     DSView/pv/utility/formatting.cpp
 )
 
@@ -394,6 +454,16 @@ set(DSView_HEADERS
     DSView/pv/prop/string.h
     DSView/pv/dialogs/storeprogress.h
     DSView/pv/storesession.h
+    DSView/pv/autosavemanager.h
+    DSView/pv/mcp/mcpserver.h
+    DSView/pv/pps/ppsdecoder.h
+    DSView/pv/pps/ppscalibration.h
+    DSView/pv/pps/ppsmanager.h
+    DSView/pv/pps/ppswriter.h
+    DSView/pv/pps/ppswavewindow.h
+    DSView/pv/dialogs/ppsconfigdlg.h
+    DSView/pv/dialogs/ppscalibdlg.h
+    DSView/pv/dock/ppsresultdock.h
     DSView/pv/view/devmode.h
     DSView/pv/dialogs/waitingdialog.h
     DSView/pv/dialogs/dsomeasure.h
@@ -448,6 +518,8 @@ set(DSView_HEADERS
     DSView/pv/deviceagent.h
     DSView/pv/ui/fn.h
     DSView/pv/ui/xtoolbutton.h
+DSView/pv/winnativewidget.h
+DSView/pv/winshadow.h
 )
  
 #===============================================================================
@@ -555,6 +627,8 @@ if(WIN32)
 	enable_language(RC)
 	# app icon
         list(APPEND DSView_SOURCES applogo.rc)
+	# Windows wide-character Win32 APIs are used (LoadLibrary(L"...") etc.).
+	add_definitions(-DUNICODE -D_UNICODE)
 endif()
 
 if(Qt5Core_FOUND)
@@ -631,6 +705,39 @@ else()
 	list(APPEND DSVIEW_LINK_LIBS ${PKGDEPS_LIBRARIES})
 endif()
 
+# Android 未嵌入 CPython 时，把解码器源码从同一目标里摘掉（它们全部依赖 Python.h）
+if(ANDROID AND NOT DSVIEW_ANDROID_PYTHON)
+	set(libsigrokdecode4DSL_SOURCES "")
+	message("----- libsigrokdecode4DSL: excluded (no Python on Android yet)")
+endif()
+
+# Android 上没有 Win32 API，也没有对应的 Qt 平台接口：
+#   winnativewidget / winshadow 是 Windows 原生窗口与阴影
+#   decoder.cpp 直接 include <Python.h>
+# 这些文件在 Android 构建里直接剔除，功能由平台无关实现替代（后续补）。
+if(ANDROID)
+	list(FILTER DSView_SOURCES EXCLUDE REGEX ".*(winnativewidget|winshadow)\\.(cpp|h)$")
+	list(FILTER libsigrok4DSL_SOURCES EXCLUDE REGEX ".*winnativewidget\\.(cpp|h)$")
+	if(DEFINED DSView_HEADERS)
+		list(FILTER DSView_HEADERS EXCLUDE REGEX ".*(winnativewidget|winshadow)\\.h$")
+	endif()
+	# moc 列表在上面的 qt6_wrap_cpp 已经生成，这里把对应产物一并摘掉
+	if(DEFINED DSView_HEADERS_MOC)
+		list(FILTER DSView_HEADERS_MOC EXCLUDE REGEX ".*moc_w(inshadow|innativewidget)\\.cpp$")
+	endif()
+	if(NOT DSVIEW_ANDROID_PYTHON)
+		list(FILTER DSView_SOURCES EXCLUDE REGEX ".*pv/data/decode/decoder\\.cpp$")
+		list(APPEND DSView_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/DSView/pv/data/decode/decoder_android_stub.cpp")
+	endif()
+	# libsigrok4DSL 的 csv.c 把格式串当变量传给 fprintf，NDK 默认开
+	# -Werror=format-security，这里对 Android 关掉（与上游行为一致）。
+	add_compile_options(-Wno-format-security)
+	# Android USB OTG 桥：Java(UsbManager) → fd → libusb_wrap_sys_device
+	list(APPEND DSView_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/DSView/pv/android/android_usb.cpp")
+	# APK assets（CPython 标准库 / 解码器脚本）落地到应用私有目录
+	list(APPEND DSView_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/DSView/pv/android/android_assets.cpp")
+endif()
+
 add_executable(${PROJECT_NAME}
 	${common_SOURCES}
 	${DSView_SOURCES}
@@ -642,6 +749,15 @@ add_executable(${PROJECT_NAME}
 )
 
 target_link_libraries(${PROJECT_NAME} ${DSVIEW_LINK_LIBS})
+
+if(ANDROID)
+    # Qt6 Android 的加载器（QtActivity -> androidjnimain）靠 dlsym 从
+    # lib<name>_<abi>.so 里取 main 来启动应用。普通 add_executable 生成的是
+    # 动态符号表里没有 main 的 ELF，dlopen 出来能加载、但函数指针是 NULL →
+    # 启动瞬间 "Fatal signal 11 ... rip 0000000000000000"。
+    # ENABLE_EXPORTS = -rdynamic，把 main 等符号放进 .dynsym。
+    set_target_properties(${PROJECT_NAME} PROPERTIES ENABLE_EXPORTS ON)
+endif()
 
 if(WIN32)
 # Pass -mwindows so that no "DOS box" will open when PulseView is started.
@@ -718,3 +834,10 @@ if(ENABLE_TESTS)
 endif(ENABLE_TESTS)
 
 
+
+# --- Android: 补齐交叉编译出来的静态库（pcre2 / libffi / intl / gmodule）
+# glib 的 pkg-config 只给了 -lglib-2.0 等，其依赖库需要显式链接。
+if(ANDROID AND DSVIEW_ANDROID_LIB_DIR)
+	link_directories(${DSVIEW_ANDROID_LIB_DIR})
+target_link_libraries(${PROJECT_NAME} pcre2-8 pcre2-posix ffi intl gmodule-2.0)
+endif()
