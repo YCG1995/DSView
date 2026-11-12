@@ -148,11 +148,13 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 	cap_form->addRow(QString(), _auto_save_loss_check);
 
 	// Calibration: the analyzer's own crystal is a few ppm off, so every
-	// measured difference is multiplied by this factor (1.0 = raw).
+	// measured difference is multiplied by this factor (1.0 = raw). Nine
+	// decimals: the calibration computes the factor with %.9f, and rounding it
+	// to six loses the ppm-level correction it exists to carry.
 	_calib_spin = new QDoubleSpinBox(cap_box);
-	_calib_spin->setDecimals(6);
+	_calib_spin->setDecimals(9);
 	_calib_spin->setRange(0.5, 2.0);
-	_calib_spin->setSingleStep(0.000001);
+	_calib_spin->setSingleStep(0.000000001);
 	_calib_spin->setValue(_result.calib_factor);
 	_calib_spin->setToolTip(QString::fromUtf8(
 		"所有时间差都会乘以该系数；可用 PPS 菜单里的“校准”自动算出。"));

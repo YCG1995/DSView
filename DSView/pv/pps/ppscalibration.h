@@ -52,6 +52,12 @@ struct PpsCalibResult
     int captures;           // captures actually averaged
     int edges;              // edges seen in the last capture
     QString input_name;     // "1PPS" or "10ms"
+    // What was actually captured, so the dialog can state whether the window
+    // went through the USB stream path and how long it really was: that path
+    // doubles the configured window.
+    double window_ms;       // window really used, in ms
+    bool stream_mode;       // true when the samples came over USB streaming
+    uint64_t sample_rate;   // rate really programmed, in Hz
 
     PpsCalibResult();
 };
@@ -90,6 +96,8 @@ signals:
 private:
     bool apply_hardware_config();
     void finish_current_capture();
+    void restart_capture_now();
+    void widen_window_and_restart();
     void advance_after_capture(bool usable, size_t edges,
             double period_samples);
 
@@ -112,6 +120,8 @@ private:
     QElapsedTimer _capture_timer;
     QTimer *_watchdog;
     bool _owns_trigger;     // registered in s_active_runs
+    bool _stream_mode;      // the last apply_hardware_config took the stream path
+    bool _widened;          // this run already widened the window once
 };
 
 } // namespace pps

@@ -186,7 +186,8 @@ private:
     QColor _cache_base;
     // Sample budget for the automatic Y range: |v - median| <= k * sigma is
     // kept, everything farther out is ignored when fitting the range.
-    double _clip_sigma = 3.0;
+    // 0 = no outlier trimming: the Y range always spans the full sample extent.
+    double _clip_sigma = 0.0;
     int _clip_outliers = 0;   // samples left out by the last fit (per band)
     mutable double _dbg_collect_ms = 0.0;  // bench only: time spent collecting
     mutable double _dbg_axis_ms = 0.0;

@@ -922,23 +922,28 @@ void PpsWaveCanvas::drawColumns(QPainter &p, const QVector<double> &xs,
 	double prev_x = 0.0;
 	double prev_y = 0.0;
 	bool have_prev = false;
+	// The curve is a polyline: every column is joined to the previous one. A
+	// column whose samples are all identical collapses to a zero-height tick,
+	// so the join is the only thing that makes a flat stretch visible. Skipping
+	// that join (an earlier "optimisation" for repeated values) punched a hole
+	// into every stable run and left the curve looking dashed, and drawing
+	// nothing at all where the value never changed.
 	for (int i = 0; i < xs.size(); ++i) {
 		const double x = xs[i];
 		const double yh = yOf(his[i]);
 		const double yl = yOf(los[i]);
-		if (i > 0 && !gap_before[i] && his[i] == his[i - 1] && los[i] == los[i - 1]
-				&& yh == yl) {
-			// Flat run: the segment would be a single pixel again and again.
-			prev_x = x;
-			prev_y = yh;
-			have_prev = true;
-			continue;
-		}
-		if (i == 0 || gap_before[i] || !have_prev) {
+		if (i > 0 && !gap_before[i] && have_prev) {
+			// Join the previous column's lowest point to this column's highest,
+			// so an envelope with changing spread stays closed.
+			p.drawLine(QPointF(prev_x, prev_y), QPointF(x, yh));
+			if (yh != yl)
+				p.drawLine(QPointF(x, yh), QPointF(x, yl));
+		} else if (yh != yl) {
 			p.drawLine(QPointF(x, yh), QPointF(x, yl));
 		} else {
-			p.drawLine(QPointF(prev_x, prev_y), QPointF(x, yh));
-			p.drawLine(QPointF(x, yh), QPointF(x, yl));
+			// First column of a run carrying a single value: a tick wide enough
+			// to survive a 1.4 px antialiased stroke.
+			p.drawLine(QPointF(x, yh), QPointF(x + 0.8, yh));
 		}
 		prev_x = x;
 		prev_y = yl;
@@ -2017,18 +2022,21 @@ void PpsWaveWindow::buildUi()
 	// Outlier trimming for the automatic Y range: one global value for every
 	// channel. A sample farther than k * sigma from the median is left out of
 	// the range fit, so a runaway frame does not stretch the band into a line.
-	// No sample is dropped when none is that far out.
+	// Trimming only shapes the axis: every sample is still drawn, the far ones
+	// just sit clamped against the band edge. Defaults to 0 (no trimming at
+	// all), which is what the range should do unless the user asks otherwise.
 	bar->addWidget(new QLabel(QString::fromUtf8("Y 轴剔除"), this));
 	_clip_spin = new QDoubleSpinBox(this);
 	_clip_spin->setRange(0.0, 10.0);
 	_clip_spin->setDecimals(1);
 	_clip_spin->setSingleStep(0.5);
-	_clip_spin->setValue(3.0);
+	_clip_spin->setValue(0.0);
 	_clip_spin->setSuffix(QString::fromUtf8(" ×MAD"));
 	_clip_spin->setMaximumWidth(96);
 	_clip_spin->setToolTip(QString::fromUtf8(
-			"自适应 Y 轴时忽略偏离中位数超过 k×1.4826×MAD 的异常值（全局统一口径）。\n"
-			"没有异常值时不剔除；0 表示始终使用完整极值。"));
+			"自适应 Y 轴时，偏离中位数超过 k×1.4826×MAD 的异常值不参与 Y 轴范围计算。\n"
+			"只影响轴的范围，不删点：所有采样照常画线，远处的点贴到色带边缘。\n"
+			"0 = 不剔除（默认，用完整极值）。"));
 	bar->addWidget(_clip_spin);
 
 	_open_btn = new QPushButton(QString::fromUtf8("打开 CSV…"), this);
@@ -2084,6 +2092,9 @@ void PpsWaveWindow::buildUi()
 			this, [this](double k) {
 		_canvas->setClipSigma(k);
 	});
+	// The spin box is filled before the connection exists, so push its value once:
+	// otherwise the canvas keeps its own default and the two disagree.
+	_canvas->setClipSigma(_clip_spin->value());
 	connect(_sel_view_act, &QAction::triggered, this, &PpsWaveWindow::onViewSelection);
 	connect(_sel_save_act, &QAction::triggered, this, &PpsWaveWindow::onSaveSelection);
 	connect(_sel_visible_act, &QAction::triggered, this, &PpsWaveWindow::onSaveVisible);

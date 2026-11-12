@@ -163,6 +163,16 @@ void PpsCalibDlg::on_finished(const pps::PpsCalibResult &result)
 		.arg(result.standard_ms, 0, 'f', 3)
 		.arg(result.measured_ms, 0, 'f', 6)
 		.arg(result.factor, 0, 'f', 9));
+	// State what was really captured. The stream path now keeps the configured
+	// window; it is only widened (once) when a frame really came back with a
+	// single edge, so the number here still tells the two cases apart.
+	append_log(QString::fromUtf8(
+		"实际采集：窗口 %1 ms（%2），%3 MSa/s，%4 次")
+		.arg(result.window_ms, 0, 'f', 0)
+		.arg(result.stream_mode ? QString::fromUtf8("Stream 模式")
+			: QString::fromUtf8("Buffer 模式"))
+		.arg(result.sample_rate / 1000000.0, 0, 'f', 0)
+		.arg(result.captures));
 	_state_label->setText(QString::fromUtf8("校准完成：系数 %1 已填入配置。")
 		.arg(result.factor, 0, 'f', 9));
 }

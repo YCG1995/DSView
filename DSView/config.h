@@ -29,7 +29,7 @@
 /* DSView version information */
 #define DS_VERSION_MAJOR 2
 #define DS_VERSION_MINOR 0
-#define DS_VERSION_MICRO 1
-#define DS_VERSION_STRING "2.0.1"
+#define DS_VERSION_MICRO 2
+#define DS_VERSION_STRING "2.0.2"
 
 #endif

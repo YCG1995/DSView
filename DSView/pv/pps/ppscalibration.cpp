@@ -49,6 +49,9 @@ PpsCalibResult::PpsCalibResult()
 	, standard_ms(0.0)
 	, captures(0)
 	, edges(0)
+	, window_ms(1200.0)
+	, stream_mode(false)
+	, sample_rate(0)
 {
 }
 
@@ -67,6 +70,8 @@ PpsCalibration::PpsCalibration(SigSession *session, QObject *parent)
 	, _last_edges(0)
 	, _last_measured_ms(0.0)
 	, _owns_trigger(false)
+	, _stream_mode(false)
+	, _widened(false)
 {
 	if (_session)
 		_session->add_msg_listener(this);
@@ -134,6 +139,7 @@ bool PpsCalibration::start(const PpsCalibConfig &cfg)
 	_last_edges = 0;
 	_last_measured_ms = 0.0;
 	_stop_requested = false;
+	_widened = false;
 
 	if (!apply_hardware_config()) {
 		emit status_message(_error);
@@ -246,8 +252,15 @@ bool PpsCalibration::apply_hardware_config()
 		rate * _cfg.window_ms / 1000.0);
 	uint64_t depth = caps.hw_depth;
 	bool stream = false;
+	_stream_mode = false;
 
-	if (depth != 0 && sample_count > depth) {
+	// Verification hook: force the stream path even when the window fits the
+	// buffer, so the stream-specific code can be exercised at the ordinary 100
+	// MHz rate (DSVIEW_PPS_CALIB_FORCE_STREAM=1).
+	const bool force_stream =
+		qgetenv("DSVIEW_PPS_CALIB_FORCE_STREAM") == "1";
+	if (force_stream
+			|| (depth != 0 && sample_count > depth)) {
 		/*
 		 * The window does not fit the sample memory. A 100M-point buffer at a
 		 * high rate is far short of a 1200 ms window, which is what the 1PPS
@@ -266,6 +279,7 @@ bool PpsCalibration::apply_hardware_config()
 		}
 		else {
 			stream = true;
+			_stream_mode = true;
 			// The driver changed the channel mode with the operation mode, so
 			// the usable channel count and the rate ceiling are new values.
 			int stream_ch = 0;
@@ -302,15 +316,15 @@ bool PpsCalibration::apply_hardware_config()
 			else
 				rate = want;
 			/*
-			 * Stream mode does not honour the trigger position the way the buffer
-			 * does: the window starts wherever the USB stream happens to begin,
-			 * so a 1200 ms window can hold a single 1PPS edge (measured phase was
-			 * ~999.93 ms) and never a second one. Take two windows worth of
-			 * samples instead - that always covers at least two periods of a 1 Hz
-			 * reference, and is merely "more edges" for a faster one. Stream has
-			 * no depth limit, so this only costs capture time.
+			 * Keep the configured window. The frame is still triggered on the
+			 * reference edge, and the trigger position below leaves a small
+			 * pre-trigger margin, so the window starts just before the edge and
+			 * the next 1 Hz edge lands ~1000 ms in: one 1200 ms window already
+			 * holds both. Doubling it was only covering a frame whose reference
+			 * edge sat too close to sample 0 to be seen; the pre-trigger margin
+			 * fixes that at the source, and advance_after_capture() still widens
+			 * the window once if a frame really comes back with a single edge.
 			 */
-			_cfg.window_ms = _cfg.window_ms * 2.0;
 			sample_count = static_cast<uint64_t>(
 				rate * _cfg.window_ms / 1000.0);
 			dsv_info("1PPS calib: stream mode, %d channel(s), %" G_GUINT64_FORMAT
@@ -348,6 +362,13 @@ bool PpsCalibration::apply_hardware_config()
 	// "capture ran free". Clamped, because ds_trigger_set_pos() asserts
 	// position <= 100.
 	int trig_pos = 0;
+	// Stream frames start at whatever the USB path delivers first, so pull the
+	// trigger a hair inwards: the reference edge then sits just inside the
+	// frame with real low samples ahead of it, which is exactly what the edge
+	// finder needs to see it as a transition instead of a frame that starts
+	// high. 1% of a 1200 ms window is ~12 ms of pre-trigger history.
+	if (_stream_mode)
+		trig_pos = 1;
 	const QString pos_env = QString::fromUtf8(qgetenv("DSVIEW_PPS_CALIB_POS"));
 	if (!pos_env.isEmpty())
 		trig_pos = qBound(0, pos_env.toInt(), 100);
@@ -363,9 +384,9 @@ bool PpsCalibration::apply_hardware_config()
 	ds_trigger_set_en(1);
 
 	dsv_info("1PPS calib: CH%d, rate %" G_GUINT64_FORMAT " Hz, %d channel mode, "
-		"%s, window %.0f ms (%" G_GUINT64_FORMAT " samples), trigger 0%%, %d capture(s)",
+		"%s, window %.0f ms (%" G_GUINT64_FORMAT " samples), trigger %d%%, %d capture(s)",
 		_cfg.channel, rate, _active_ch_num, stream ? "stream" : "buffer",
-		_cfg.window_ms, sample_count, _cfg.captures);
+		_cfg.window_ms, sample_count, trig_pos, _cfg.captures);
 	return true;
 }
 
@@ -463,10 +484,108 @@ void PpsCalibration::finish_current_capture()
 	advance_after_capture(true, edges.size(), period_samples);
 }
 
+void PpsCalibration::restart_capture_now()
+{
+	if (!_running || _stop_requested || _session == nullptr)
+		return;
+	_capture_timer.restart();
+	if (!_session->start_capture(false)) {
+		dsv_err("1PPS calib: deferred re-arm failed to start a capture");
+		_error = QString::fromUtf8("重新触发校准采集失败。");
+		_running = false;
+		if (_owns_trigger) {
+			s_active_runs--;
+			_owns_trigger = false;
+		}
+		if (_watchdog)
+			_watchdog->stop();
+		ds_trigger_set_en(0);
+		emit failed(_error);
+		return;
+	}
+	_watchdog->start(static_cast<int>(_cfg.window_ms * 3 + 4000));
+}
+
+void PpsCalibration::widen_window_and_restart()
+{
+	if (!_running || _stop_requested || _session == nullptr)
+		return;
+
+	const double original_window = _cfg.window_ms;
+	_cfg.window_ms = original_window * 2.0;
+	dsv_info("1PPS calib: widening the window to %.0f ms", _cfg.window_ms);
+
+	/*
+	 * Only the limit changes here. Re-entering apply_hardware_config() mid-run
+	 * would switch the operation mode back and forth and re-program the rate,
+	 * channels and trigger while the previous capture is still being unwound -
+	 * that is what made the very first implementation crash. The device is
+	 * already in stream mode at the right rate, so the window is just a new
+	 * limit plus a matching trigger margin.
+	 */
+	DeviceAgent *dev = _session->get_device();
+	_sample_count = static_cast<uint64_t>(_active_rate * _cfg.window_ms / 1000.0);
+	if (dev == nullptr || _sample_count == 0
+			|| !dev->set_config_uint64(SR_CONF_LIMIT_SAMPLES, _sample_count)) {
+		dsv_err("1PPS calib: widened limit rejected");
+		_cfg.window_ms = original_window;
+		_sample_count = static_cast<uint64_t>(
+			_active_rate * _cfg.window_ms / 1000.0);
+		_error = QString::fromUtf8("放宽校准窗口时下发采集长度失败。");
+		_running = false;
+		if (_owns_trigger) {
+			s_active_runs--;
+			_owns_trigger = false;
+		}
+		if (_watchdog)
+			_watchdog->stop();
+		ds_trigger_set_en(0);
+		emit failed(_error);
+		return;
+	}
+
+	_capture_timer.restart();
+	if (!_session->start_capture(false)) {
+		dsv_err("1PPS calib: widened window could not start a capture");
+		_cfg.window_ms = original_window;
+		_error = QString::fromUtf8("放宽校准窗口后重新触发采集失败。");
+		_running = false;
+		if (_owns_trigger) {
+			s_active_runs--;
+			_owns_trigger = false;
+		}
+		if (_watchdog)
+			_watchdog->stop();
+		ds_trigger_set_en(0);
+		emit failed(_error);
+		return;
+	}
+	_watchdog->start(static_cast<int>(_cfg.window_ms * 3 + 4000));
+}
+
 void PpsCalibration::advance_after_capture(bool usable, size_t edges,
 		double period_samples)
 {
 	Q_UNUSED(edges);
+
+	// Stream mode keeps the configured window, so a frame that genuinely came
+	// back with a single edge means the reference edge sat outside the frame
+	// (or the trigger did not latch). Widen the window once - but never from
+	// inside this capture-end message handler: the reconfiguration tears the
+	// device state down while the finish message is still being delivered,
+	// which crashed the first implementation. Hand it to the event loop and
+	// return; DSVIEW_PPS_CALIB_WIDEN=0 keeps the window fixed for diagnosis.
+	if (!usable && !_stop_requested && _stream_mode && !_widened && _retry == 0
+			&& qgetenv("DSVIEW_PPS_CALIB_WIDEN") != "0") {
+		_widened = true;
+		dsv_info("1PPS calib: single edge in a %.0f ms stream frame, "
+			"widening the window once", _cfg.window_ms);
+		emit status_message(QString::fromUtf8(
+			"  该窗口内只看到一个沿，临时把窗口放宽到 %1 ms 重试一次。")
+			.arg(_cfg.window_ms * 2.0, 0, 'f', 0));
+		QTimer::singleShot(100, this, [this]() { widen_window_and_restart(); });
+		return;
+	}
 
 	// A frame where the input edge spacing left only one edge in the window is
 	// retried rather than counted, so "10 captures" really averages 10 usable
@@ -478,6 +597,13 @@ void PpsCalibration::advance_after_capture(bool usable, size_t edges,
 		emit status_message(QString::fromUtf8(
 			"  本次没有采到两个沿，重测（第 %1 次尝试，已得 %2/%3 次）。")
 			.arg(_retry + 1).arg(_usable).arg(_cfg.captures));
+		// Stream re-arms through the event loop as well: restarting a stream
+		// capture from inside the capture-end handler re-entered the driver
+		// while its transfers were still being torn down.
+		if (_stream_mode) {
+			QTimer::singleShot(100, this, [this]() { restart_capture_now(); });
+			return;
+		}
 		_capture_timer.restart();
 		if (_session->start_capture(false)) {
 			_watchdog->start(static_cast<int>(_cfg.window_ms * 3 + 4000));
@@ -516,9 +642,13 @@ void PpsCalibration::advance_after_capture(bool usable, size_t edges,
 
 	if (_usable == 0) {
 		_error = QString::fromUtf8(
-			"校准失败：CH%1 在 %.0f ms 窗口内没有采到两个上升沿，"
+			"校准失败：CH%1 在 %.0f ms 窗口内没有采到两个上升沿。%2"
 			"请确认信号接到该通道上（10ms 或 1PPS 都可以）。")
-			.arg(_cfg.channel).arg(_cfg.window_ms);
+			.arg(_cfg.channel).arg(_cfg.window_ms)
+			.arg(_stream_mode
+				? QString::fromUtf8("Stream 模式下帧起点不跟随触发点，"
+					"1PPS 建议把采集时间调到 1800–2000 ms 再试。")
+				: QString());
 		emit failed(_error);
 		return;
 	}
@@ -536,6 +666,9 @@ void PpsCalibration::advance_after_capture(bool usable, size_t edges,
 		res.input_name = QString::fromUtf8("10ms");
 	}
 	res.factor = res.standard_ms / res.measured_ms;
+	res.window_ms = _cfg.window_ms;
+	res.stream_mode = _stream_mode;
+	res.sample_rate = _active_rate;
 
 	dsv_info("1PPS calib: %s input, measured %.6f ms (standard %.1f ms) over "
 		"%d capture(s), factor %.9f",
