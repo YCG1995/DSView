@@ -393,9 +393,9 @@ namespace pv
         _vertical_layout->addWidget(_view);
 
 
-        // 桌面端工具栏图标 48x48：40x40 在 100% 缩放屏幕上偏小，用户反馈看不清；
-        // 图标框放大后按钮随之变高，文字行高不变。
-        setIconSize(QSize(48, 48));
+        // 桌面端工具栏图标 38x38：40x40 在 100% 缩放屏幕上偏大，48x48 更大，
+        // 用户指定用 38；图标框大小决定按钮高度，文字行高不变。
+        setIconSize(QSize(38, 38));
 #if defined(Q_OS_ANDROID)
         /* 手机屏宽只有 360~430dp，桌面版把采样/触发/文件/Logo 四条工具栏排在
          * 一行，右侧会被裁掉。这里换成两行：第一行 Logo + 采样，第二行触发 + 文件。
@@ -419,7 +419,7 @@ namespace pv
 #else
         addToolBar(_logo_bar);
 
-        // 图标放大到 48 后按钮默认宽度按图标算，文字（"模式(E)"、"选项(0)"）会被
+        // 图标放到 38 后按钮默认宽度按图标算，文字（"模式(E)"、"选项(0)"）会被
         // 折成两行；这里按文字实际宽度给每个按钮一个最小宽度，保持单行。
         QToolBar *desktopBars[] = {_sampling_bar, _trig_bar, _file_bar, _logo_bar};
         for (QToolBar *bar : desktopBars) {
@@ -431,12 +431,12 @@ namespace pv
                 // QToolBar::addWidget() 添加的按钮（模式/开始/立即/选项/设备类型）
                 // 不会继承工具栏的 iconSize，仍用样式默认的 24x24，这里统一显式设置，
                 // 否则图标放大后只有走 addAction 的按钮变大。
-                tb->setIconSize(QSize(48, 48));
+                tb->setIconSize(QSize(38, 38));
 
                 // 兜底：样表里只有 QMainWindow 级别的 icon-size，采样栏这类
                 // 通过 addWidget 挂按钮的工具栏不会自动继承，这里直接把工具栏
                 // 自己的 iconSize 也写死，保证按钮取图标尺寸时有一致的来源。
-                bar->setIconSize(QSize(48, 48));
+                bar->setIconSize(QSize(38, 38));
                 if (tb->text().isEmpty())
                     continue;
                 const int text_w = tb->fontMetrics().boundingRect(tb->text()).width() + 14;
