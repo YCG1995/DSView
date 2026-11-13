@@ -69,8 +69,11 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 
 	pps::query_device_caps(_session, _caps);
 
-	// Two columns: the reference-channel box sits above the capture-parameter
-	// box on the left, the test-channel tables fill the right column.
+	// Two columns: reference-channel and capture-parameter boxes are stacked
+	// tight in one left column, the test-channel tables fill the right column.
+	// The two left boxes used to be separate grid rows, so the tall channel
+	// tables in the first row pushed 采集参数 to the very bottom and left a
+	// hole between it and 参考通道. One container keeps them adjacent.
 	QGridLayout *root = new QGridLayout(this);
 	root->setColumnStretch(1, 1);
 	root->setRowStretch(2, 0);
@@ -96,7 +99,6 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 	_pos_spin->setRange(0, 100);
 	_pos_spin->setSuffix(" %");
 	ref_form->addRow(QString::fromUtf8("触发位置"), _pos_spin);
-	root->addWidget(ref_box, 0, 0, Qt::AlignTop);
 
 	QGroupBox *cap_box = new QGroupBox(QString::fromUtf8("采集参数"), this);
 	QFormLayout *cap_form = new QFormLayout(cap_box);
@@ -181,7 +183,16 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 	_calib_spin->setToolTip(QString::fromUtf8(
 		"所有时间差都会乘以该系数；可用 PPS 菜单里的“校准”自动算出。"));
 	cap_form->addRow(QString::fromUtf8("校准系数"), _calib_spin);
-	root->addWidget(cap_box, 1, 0, Qt::AlignTop);
+
+	// Left column: 参考通道 on top, 采集参数 directly beneath it.
+	QWidget *left_col = new QWidget(this);
+	QVBoxLayout *left_layout = new QVBoxLayout(left_col);
+	left_layout->setContentsMargins(0, 0, 0, 0);
+	left_layout->setSpacing(6);
+	left_layout->addWidget(ref_box);
+	left_layout->addWidget(cap_box);
+	left_layout->addStretch(1);
+	root->addWidget(left_col, 0, 0, 2, 1, Qt::AlignTop);
 
 	QGroupBox *ch_box = new QGroupBox(QString::fromUtf8("测试通道"), this);
 	QHBoxLayout *ch_layout = new QHBoxLayout(ch_box);
@@ -209,7 +220,7 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 	ch_layout->addWidget(_channel_col2, 0, Qt::AlignTop);
 	ch_layout->addStretch(1);
 	ch_layout->setAlignment(Qt::AlignTop);
-	root->addWidget(ch_box, 0, 1, Qt::AlignTop);
+	root->addWidget(ch_box, 0, 1, 2, 1, Qt::AlignTop);
 
 	QDialogButtonBox *buttons = new QDialogButtonBox(this);
 	QPushButton *ok = new QPushButton(QString::fromUtf8("确定"), buttons);
