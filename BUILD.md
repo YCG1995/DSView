@@ -63,6 +63,38 @@ Copy-Item -LiteralPath 'D:\AI项目\DSView-master\build.dir\DSView.exe' `
 
 然后双击 `<运行目录>\DSView.exe`。该目录自带全部依赖，与本工程目录、工具链路径均无关，可整体拷到任意机器/任意盘运行。
 
+### 为什么 build.dir 默认不能直接运行
+
+`build.dir` 只是 CMake 的 `EXECUTABLE_OUTPUT_PATH`，里面只有链接产物（`DSView.exe`）和中间对象。下面这些不是编译产物，所以不会自动出现在那里：
+
+| 缺失项 | 作用 | 来源 |
+|---|---|---|
+| `Qt5Core.dll` / `Qt5Gui.dll` / `Qt5Widgets.dll` / `Qt5Network.dll` / `Qt5Svg.dll` / `Qt5WinExtras.dll` | Qt 运行库（动态链接） | 工具链 `ucrt64/bin` |
+| `platforms/`、`imageformats/`、`iconengines/`、`styles/` | Qt 插件（缺 `qwindows.dll` 会直接 `0xc000007b`/无法建窗口） | 同上 |
+| `libusb-1.0.dll`、`libfftw3-3.dll`、`libpython3.14.dll`、`libglib-2.0-0.dll`、ICU/PCRE2/zlib 等 | 驱动、FFT、内嵌 Python、glib 的运行库 | 同上 |
+| `lib/python3.14` | 内嵌解释器的标准库（缺了报 `Failed to import encodings module`） | `ucrt64/lib/python3.14` |
+| `res/`、`demo/` | 固件与示例波形，程序按 **exe 所在目录** 相对查找 | 源码 `DSView/res`、`DSView/demo` |
+| `lang/` | 界面语言资源 | 源码 `lang/` |
+| `decoders/` | 解码脚本（683 个文件） | 源码 `libsigrokdecode4DSL/decoders` |
+
+上游的 `install()` 规则是 Linux 布局（`bin/` + `share/DSView`），Windows 上不产生“就地可运行”目录，所以默认是编译目录、运行目录分开。
+
+### 让 build.dir 就地可运行
+
+```powershell
+pwsh -File .\deploy_runtime.ps1 -Template 'C:\Users\12971\Doubao\chats\2026-11-10\new-chat\DSView-win64'
+```
+
+脚本把运行目录里的 33 个 DLL、Qt 插件目录、`res/`、`demo/`、`lang/`、`decoders/`、`lib/python3.14` 铺进 `build.dir`（约 3,244 个文件 / 144 MB，不复制旧 exe、autosave 与说明文档）。之后：
+
+```
+D:\AI项目\DSView-master\build.dir\DSView.exe
+```
+
+即可直接双击运行，不再需要任何其它路径。已实测：从该路径启动、识别 `DSLogic U2Pro16`、采样率 1G 正常。
+
+注意：`build.dir` 被 `.gitignore` 忽略，且 `cmake -S . -B build` 重新配置不会清空它；但如果手动删了 `build.dir`，重编后要再跑一次这个脚本。
+
 ## 已含的定制
 
 - PPS 只采集选中的通道（参考通道 + 测量通道），USB 传输量约降到 1/2.8。
