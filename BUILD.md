@@ -15,11 +15,13 @@
 
 ## 工具链
 
-MSYS2 / MinGW-w64 UCRT64（Qt 5.15.19 + libusb + fftw + zlib + boost + Python 3.14）：
+MSYS2 / MinGW-w64 UCRT64（Qt 5.15.19 + libusb + fftw + zlib + boost + Python 3.14），已迁到：
 
 ```
-C:/Users/12971/Doubao/chats/2026-11-10/new-chat/_toolchain/msys64/ucrt64
+C:/software/msys64/ucrt64
 ```
+
+（旧的 `C:/Users/12971/Doubao/chats/2026-11-10/new-chat/_toolchain/msys64/ucrt64` 已弃用，配置时必须指向新路径。）
 
 ## 两个必须知道的构建约束
 
@@ -42,18 +44,24 @@ export MSYSTEM=UCRT64
 cd /d/DSView-work
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-      -DPython3_ROOT_DIR=C:/Users/12971/Doubao/chats/2026-11-10/new-chat/_toolchain/msys64/ucrt64
+      -DPython3_ROOT_DIR=C:/software/msys64/ucrt64
 cmake --build build          # 或 cd build && ninja
 ```
 
 产物：`D:\DSView-work\build.dir\DSView.exe`（= `D:\AI项目\DSView-master\build.dir\DSView.exe`）。
 
-## 部署到便携目录
+## 运行方式（重要）
+
+Qt 是动态链接，**exe 不能单独拷走运行**：单独一个 `DSView.exe` 放到空目录双击会以 `0xC0000135`（DLL 未找到）立即退出。
+
+正确用法是带上完整运行目录（`DSView-win64`，约 160 MB，含 33 个 DLL、`res/`、`lang/`、`decoders/`、`platforms/` 等）：
 
 ```powershell
-Stop-Process -Name DSView -Force -ErrorAction SilentlyContinue
-Copy-Item -LiteralPath 'D:\AI项目\DSView-master\build.dir\DSView.exe' -Destination '<DSView-win64>\DSView.exe' -Force
+Copy-Item -LiteralPath 'D:\AI项目\DSView-master\build.dir\DSView.exe' `
+          -Destination '<运行目录>\DSView.exe' -Force
 ```
+
+然后双击 `<运行目录>\DSView.exe`。该目录自带全部依赖，与本工程目录、工具链路径均无关，可整体拷到任意机器/任意盘运行。
 
 ## 已含的定制
 
