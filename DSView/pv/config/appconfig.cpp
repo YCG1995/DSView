@@ -419,7 +419,12 @@ void AppConfig::GetFontSizeRange(float *minSize, float *maxSize)
         *maxSize = 12;
 #endif
 
-#ifdef Q_OS_LINUX
+#ifdef Q_OS_ANDROID
+        /* 手机屏幕小、观看距离近，桌面版的 11pt 在手机上几乎看不清。
+         * 默认值取区间中值 = 13pt。 */
+        *minSize = 10;
+        *maxSize = 16;
+#elif defined(Q_OS_LINUX)
         *minSize = 8;
         *maxSize = 14;
 #endif

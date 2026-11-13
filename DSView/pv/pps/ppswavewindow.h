@@ -242,6 +242,9 @@ public slots:
 
 private:
     void buildUi();
+    // Fill the view from the frames the manager recorded since 开始测量, so
+    // opening this window mid-run does not lose the beginning of the run.
+    void seedFromHistory();
     void appendLiveFrame();
     void recordFrame(double t_ms, const QVector<QString> &names,
                      const QVector<double> &values,

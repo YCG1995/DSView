@@ -32,6 +32,11 @@
 #include "../config/appconfig.h"
 #include "../ui/fn.h"
 #include "../ui/popupdlglist.h"
+#if defined(Q_OS_ANDROID)
+#include "../android/android_ui.h"
+#include <QScreen>
+#include <QGuiApplication>
+#endif
 
 namespace pv {
 namespace dialogs {
@@ -112,6 +117,14 @@ void DSDialog::reject()
     QDialog::reject();
 }
   
+void DSDialog::showEvent(QShowEvent *event)
+{
+    QDialog::showEvent(event);
+#if defined(Q_OS_ANDROID)
+    android_fit_to_screen(this);
+#endif
+}
+
 void DSDialog::setTitle(QString title)
 {
     if (_titlebar){
@@ -197,7 +210,18 @@ void DSDialog::update_font()
 void DSDialog::show()
 {
     update_font();
-    
+
+#if defined(Q_OS_ANDROID)
+    /* 手机屏窄，桌面尺寸的对话框会超出屏幕、按钮点不到：压到可用区域并居中 */
+    android_fit_to_screen(this);
+    QScreen *scr = QGuiApplication::primaryScreen();
+    if (scr) {
+        QRect avail = scr->availableGeometry();
+        move(avail.left() + (avail.width() - width()) / 2,
+             avail.top() + (avail.height() - height()) / 2);
+    }
+#endif
+
     QWidget::show();
 }
 

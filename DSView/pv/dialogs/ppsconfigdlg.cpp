@@ -139,13 +139,35 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 	dir_layout->setContentsMargins(0, 0, 0, 0);
 	dir_layout->addWidget(_dir_edit);
 	dir_layout->addWidget(_browse_btn);
-	cap_form->addRow(QString::fromUtf8("CSV 保存目录"), dir_layout);
+	cap_form->addRow(QString::fromUtf8("CSV 目录"), dir_layout);
 
-	// One master switch for "keep the raw frame when a channel drops out"; the
-	// per-channel tick lives in the channel table (column "保存").
-	_auto_save_loss_check = new QCheckBox(
-		QString::fromUtf8("数据丢失时自动保存 DSL 文件"), cap_box);
-	cap_form->addRow(QString(), _auto_save_loss_check);
+	// DSL auto-save: one row of independent ticks, laid out exactly like the
+	// CSV 目录 row above (caption on the left, controls on the right). It used to
+	// sit in a nested group box, which added a second frame inside the form and
+	// left the ticks visibly indented against every other row.
+	QWidget *save_row_host = new QWidget(cap_box);
+	QHBoxLayout *save_row = new QHBoxLayout(save_row_host);
+	save_row->setContentsMargins(0, 0, 0, 0);
+	save_row->setSpacing(12);
+
+	_auto_save_loss_check = new QCheckBox(QString::fromUtf8("数据丢失"),
+		save_row_host);
+	_auto_save_loss_check->setToolTip(QString::fromUtf8(
+		"勾选“保存”的通道在本帧内没有边沿时，保存原始帧。"));
+	save_row->addWidget(_auto_save_loss_check);
+
+	_save_multi_check = new QCheckBox(QString::fromUtf8("异常脉冲"),
+		save_row_host);
+	_save_multi_check->setToolTip(QString::fromUtf8(
+		"勾选“保存”的通道在本帧内出现多个边沿（大于 1 个）时，保存原始帧。"));
+	save_row->addWidget(_save_multi_check);
+
+	// "无条件保存" used to live here. It now sits in the result dock, right of
+	// "停止", so it can be flipped while a measurement is running instead of
+	// only before the run starts.
+	save_row->addStretch(1);
+
+	cap_form->addRow(QString::fromUtf8("DSL 保存"), save_row_host);
 
 	// Calibration: the analyzer's own crystal is a few ppm off, so every
 	// measured difference is multiplied by this factor (1.0 = raw). Nine
@@ -207,7 +229,10 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 	_ref_edge_check->setChecked(_result.ref_edge == pps::PPS_EDGE_FALLING);
 	_pos_spin->setValue(_result.trigger_pos_percent);
 	_dir_edit->setText(_result.save_dir);
-	_auto_save_loss_check->setChecked(_result.auto_save_loss);
+	// A long path would otherwise scroll to its end; show the head instead.
+	_dir_edit->setCursorPosition(0);
+	_auto_save_loss_check->setChecked(_result.dsl_save_loss);
+	_save_multi_check->setChecked(_result.dsl_save_abnormal);
 
 	// Channel range: restore the pinned one, otherwise prefer the 8-channel
 	// range because it is the one that reaches 1GHz.
@@ -234,6 +259,8 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 	connect(_time_combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
 		this, &PpsConfigDlg::on_time_changed);
 	connect(_auto_save_loss_check, &QCheckBox::toggled,
+		this, &PpsConfigDlg::on_auto_save_toggle);
+	connect(_save_multi_check, &QCheckBox::toggled,
 		this, &PpsConfigDlg::on_auto_save_toggle);
 	connect(ok, &QPushButton::clicked, this, &PpsConfigDlg::on_accept);
 	connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
@@ -423,9 +450,52 @@ void PpsConfigDlg::build_time_options()
 	_building = false;
 }
 
+void PpsConfigDlg::collect_channel_state()
+{
+	_result.channels.clear();
+	_result.disabled_channels.clear();
+	for (QTableWidget *t : { _channel_table, _channel_table2 }) {
+		for (int row = 0; row < t->rowCount(); ++row) {
+			QTableWidgetItem *name_item = t->item(row, 1);
+			if (name_item == nullptr)
+				continue;
+			const QString name = name_item->text();
+			const int index = name.mid(2).toInt();
+
+			QTableWidgetItem *enable_item = t->item(row, 0);
+			if (enable_item == nullptr ||
+				enable_item->checkState() != Qt::Checked) {
+				// Remembered so the dialog shows the same tick state next time.
+				_result.disabled_channels.push_back(index);
+				continue;
+			}
+
+			pps::PpsChannel ch;
+			ch.channel_index = index;
+			QCheckBox *edge_check = qobject_cast<QCheckBox *>(
+				t->cellWidget(row, 2));
+			ch.edge = (edge_check && edge_check->isChecked())
+				? pps::PPS_EDGE_FALLING : pps::PPS_EDGE_RISING;
+			QCheckBox *save_check = qobject_cast<QCheckBox *>(
+				t->cellWidget(row, 3));
+			ch.save_on_loss = (save_check && save_check->isChecked());
+			ch.enabled = true;
+			_result.channels.push_back(ch);
+		}
+	}
+}
+
 void PpsConfigDlg::build_channel_table()
 {
 	_building = true;
+
+	// The tables are the only place the per-channel choices live, and rebuilding
+	// them destroys those widgets. Capture them before the rows go away: the
+	// `previous` map below could only ever see the last *accepted* configuration,
+	// so changing the samplerate, the range or the reference channel used to
+	// silently reset every tick, edge and save flag.
+	if (_table_built)
+		collect_channel_state();
 	int ref = _ref_combo->currentData().toInt();
 	const uint64_t rate = _rate_combo->currentData().value<uint64_t>();
 	int usable = _caps.channels_for_rate(rate);
@@ -493,17 +563,21 @@ void PpsConfigDlg::build_channel_table()
 		edge_check->setChecked(edge == pps::PPS_EDGE_FALLING);
 		table->setCellWidget(table_row, 2, edge_check);
 
-		// Per-channel "keep the raw frame when this channel drops out".
+		// Per-channel "keep this channel's raw frame when the selected DSL
+		// conditions happen".
 		QCheckBox *save_check = new QCheckBox(QString::fromUtf8("保存"), table);
 		bool save_on_loss = previous.contains(i) ? previous[i].save_on_loss
-			: _result.auto_save_loss;
+			: (_result.dsl_save_loss || _result.dsl_save_abnormal ||
+				_result.dsl_save_always);
 		save_check->setChecked(save_on_loss);
-		save_check->setEnabled(_auto_save_loss_check->isChecked());
+		save_check->setEnabled(_auto_save_loss_check->isChecked() ||
+			_save_multi_check->isChecked());
 		table->setCellWidget(table_row, 3, save_check);
 	}
 	_channel_col2->setVisible(right_rows > 0);
 	fit_channel_table(_channel_table);
 	fit_channel_table(_channel_table2);
+	_table_built = true;
 	_building = false;
 	if (isVisible())
 		adjustSize();
@@ -600,10 +674,12 @@ void PpsConfigDlg::browse_dir()
 
 void PpsConfigDlg::on_auto_save_toggle()
 {
-	// The master switch only gates the per-channel ticks; it does not overwrite
-	// the choices the user already made.
-	const bool on = _auto_save_loss_check->isChecked();
-	_result.auto_save_loss = on;
+	// Any DSL checkbox makes the per-channel ticks meaningful; turning all of
+	// them off greys the column without overwriting the user's choices.
+	const bool on = _auto_save_loss_check->isChecked() ||
+		_save_multi_check->isChecked();
+	_result.dsl_save_loss = _auto_save_loss_check->isChecked();
+	_result.dsl_save_abnormal = _save_multi_check->isChecked();
 	for (QTableWidget *t : { _channel_table, _channel_table2 }) {
 		for (int r = 0; r < t->rowCount(); ++r) {
 			QCheckBox *box = qobject_cast<QCheckBox *>(t->cellWidget(r, 3));
@@ -623,39 +699,12 @@ void PpsConfigDlg::on_accept()
 	_result.mode_channels = _range_combo->currentData().toInt();
 	_result.capture_time_ms = _time_combo->currentData().toDouble();
 	_result.save_dir = _dir_edit->text();
-	_result.auto_save_loss = _auto_save_loss_check->isChecked();
+	_result.dsl_save_loss = _auto_save_loss_check->isChecked();
+	_result.dsl_save_abnormal = _save_multi_check->isChecked();
+	// dsl_save_always is owned by the result dock's "自动保存波形" checkbox and
+	// is deliberately left untouched here.
 	_result.calib_factor = _calib_spin->value();
-	_result.channels.clear();
-	_result.disabled_channels.clear();
-	for (QTableWidget *t : { _channel_table, _channel_table2 }) {
-		for (int row = 0; row < t->rowCount(); ++row) {
-			QTableWidgetItem *name_item = t->item(row, 1);
-			if (name_item == nullptr)
-				continue;
-			const QString name = name_item->text();
-			const int index = name.mid(2).toInt();
-
-			QTableWidgetItem *enable_item = t->item(row, 0);
-			if (enable_item == nullptr ||
-				enable_item->checkState() != Qt::Checked) {
-				// Remembered so the dialog shows the same tick state next time.
-				_result.disabled_channels.push_back(index);
-				continue;
-			}
-
-			pps::PpsChannel ch;
-			ch.channel_index = index;
-			QCheckBox *edge_check = qobject_cast<QCheckBox *>(
-				t->cellWidget(row, 2));
-			ch.edge = (edge_check && edge_check->isChecked())
-				? pps::PPS_EDGE_FALLING : pps::PPS_EDGE_RISING;
-			QCheckBox *save_check = qobject_cast<QCheckBox *>(
-				t->cellWidget(row, 3));
-			ch.save_on_loss = (save_check && save_check->isChecked());
-			ch.enabled = true;
-			_result.channels.push_back(ch);
-		}
-	}
+	collect_channel_state();
 
 	if (_result.channels.empty()) {
 		QMessageBox::warning(this, QString::fromUtf8("1PPS 测量配置"),

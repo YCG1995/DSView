@@ -155,6 +155,15 @@ public:
     int64_t get_mark_index();
     void frame_ended();
 
+    /**
+     * Limit decoding to the first @a samples samples of the current data.
+     * 0 means "decode everything". Used by the debug console for fast
+     * iteration on scripts.
+     */
+    inline void set_debug_sample_limit(uint64_t samples){
+        _debug_sample_limit = samples;
+    }
+
     inline QString error_message(){ 
 	    return _error_message;
     }
@@ -183,6 +192,10 @@ public:
 
     bool check_required_probes();
 
+    void log_probe_diagnosis(const char *reason);
+
+    bool ensure_required_probes();
+
     inline uint64_t get_result_count(){
         return _result_count;
     }
@@ -190,6 +203,10 @@ public:
 private:
     void decode_data(const uint64_t decode_start, const uint64_t decode_end, srd_session *const session);
 	void execute_decode_stack();
+	// Drop root-decoder channel bindings that point at a channel this capture
+	// does not carry, and give required channels a channel that does exist. Keeps
+	// auto decode working after the capture mode/rate changed the channel set.
+	void rebind_stale_probes();
 	static void annotation_callback(srd_proto_data *pdata, void *self);
     void do_decode_work();
   
@@ -200,6 +217,7 @@ signals:
 private: 
 	std::list<decode::Decoder*> _stack;
 	pv::data::LogicSnapshot *_snapshot;
+    uint64_t _debug_sample_limit = 0;
   
     std::map<const decode::Row, decode::RowData*>   _rows;
     std::map<const decode::Row, bool>       _rows_gshow;

@@ -194,7 +194,8 @@ uint64_t PpsDecoder::find_all_edges(LogicSnapshot *snapshot, int channel_index,
 
 vector<PpsResult> PpsDecoder::decode(LogicSnapshot *snapshot,
 		uint64_t sample_count, uint64_t sample_rate,
-		uint64_t ref_trigger_sample, const vector<PpsChannel> &channels)
+		uint64_t ref_trigger_sample, const vector<PpsChannel> &channels,
+		bool count_edges)
 {
 	vector<PpsResult> results;
 	if (snapshot == nullptr || sample_rate == 0 || sample_count == 0)
@@ -209,6 +210,7 @@ vector<PpsResult> PpsDecoder::decode(LogicSnapshot *snapshot,
 		r.channel_index = ch.channel_index;
 		r.valid = false;
 		r.delta_ns = 0.0;
+		r.edge_count = 0;
 
 		if (ch.enabled) {
 			uint64_t edge = 0;
@@ -218,6 +220,14 @@ vector<PpsResult> PpsDecoder::decode(LogicSnapshot *snapshot,
 						- static_cast<int64_t>(t0);
 				r.valid = true;
 				r.delta_ns = static_cast<double>(diff) * ns_per_sample;
+			}
+
+			// Edge count for the abnormal-pulse check. Only two are needed: the
+			// condition is "more than one edge", so find_all_edges stops at 2.
+			if (count_edges) {
+				vector<uint64_t> edges;
+				r.edge_count = static_cast<int>(find_all_edges(snapshot,
+						ch.channel_index, ch.edge, sample_count, edges, 2));
 			}
 		}
 		results.push_back(r);

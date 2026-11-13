@@ -46,6 +46,7 @@ private:
     void sync_range_to_rate();
     void build_time_options();
     void build_channel_table();
+    void collect_channel_state();
     void make_channel_table(QTableWidget *&table, QWidget *parent);
     void fit_channel_table(QTableWidget *table);
     uint64_t max_rate_for_range(int channels) const;
@@ -55,6 +56,7 @@ private:
     pps::PpsConfig _result;
     pps::PpsDeviceCaps _caps;
     bool _building;
+    bool _table_built = false;   // channel tables already hold the user's state
 
     QComboBox *_ref_combo;
     QComboBox *_range_combo;        // CH0-CH7 (1GHz) / CH0-CH15 (500MHz)
@@ -64,7 +66,8 @@ private:
     QComboBox *_rate_combo;
     QLineEdit *_dir_edit;
     QPushButton *_browse_btn;
-    QCheckBox *_auto_save_loss_check; // save the raw frame when data is missing
+    QCheckBox *_auto_save_loss_check; // "数据丢失" DSL 保存
+    QCheckBox *_save_multi_check;     // "异常脉冲" DSL 保存
     QDoubleSpinBox *_calib_spin;    // multiplier applied to every delta
     QTableWidget *_channel_table;   // CH0-CH7, left column
     QTableWidget *_channel_table2;  // CH8-CH15, right column

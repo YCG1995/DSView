@@ -24,6 +24,7 @@
 #define DSVIEW_PV_STORESESSION_H
 
 #include <stdint.h>
+#include <atomic>
 #include <string>
 #include <thread>  
 #include <QObject>
@@ -125,11 +126,14 @@ private:
 	uint64_t        _unit_count;
     bool            _has_error;
 	QString         _error;
-    volatile bool   _canceled;
+    // Written by the save thread, read by the capture thread: volatile only
+    // stops the compiler caching them, it does not make the read-modify-write
+    // of a flag atomic.
+    std::atomic<bool> _canceled;
     ZipMaker        m_zipDoc;  
     uint64_t        _start_index;
     uint64_t        _end_index;
-    volatile bool   _is_busy;
+    std::atomic<bool> _is_busy;
 };
 
 } // pv

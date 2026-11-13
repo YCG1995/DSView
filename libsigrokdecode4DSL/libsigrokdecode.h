@@ -401,10 +401,12 @@ SRD_API int srd_decoder_load_all(void);
 SRD_API int srd_decoder_unload_all(void);
 SRD_API struct srd_decoder *srd_decoder_get_by_module_name(const char *name);
 SRD_API int srd_decoder_reload(const char *id);
+SRD_API int srd_decoder_check(const char *module_name, char **error);
 
 /* srd.c - captured stdout/stderr from decoder scripts. */
 SRD_API char *srd_console_take(int do_clear);
 SRD_API void srd_console_clear(void);
+SRD_API void srd_console_write(const char *text);
 
 /* instance.c */
 SRD_API int srd_inst_option_set(struct srd_decoder_inst *di,

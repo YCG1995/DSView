@@ -2,6 +2,7 @@
  * 1PPS waveform window — implementation.
  */
 #include "ppswavewindow.h"
+#include "ppstesthooks.h"
 #include "ppsmanager.h"
 #include "../log.h"
 
@@ -60,10 +61,12 @@ namespace pv {
 namespace pps {
 
 static const char *kColors[] = {
-	"#2f7ed8", "#e06b1a", "#2a9d3f", "#d13a3a", "#8a5fc4",
-	"#8c6a3f", "#d76aa8", "#6c7a89", "#b8a52c", "#1aa7b8",
-	"#4a5fa8", "#6b8f4a", "#a8732a", "#9a3b3b", "#7a4a8a",
-	"#367fa0"
+	// CH0 is the one most often looked at alone, and it was too dark against the
+	// dark theme, so the first colour is a brighter blue now.
+	"#4da3ff", "#e8813a", "#3cb85a", "#e55252", "#a97ee0",
+	"#b0854f", "#e57fb4", "#8c9aa8", "#d4c33c", "#2cc0d2",
+	"#6378c4", "#86b061", "#c98c3f", "#b95454", "#9a5fa8",
+	"#4a9bc0"
 };
 static const int kColorCount = sizeof(kColors) / sizeof(kColors[0]);
 
@@ -386,6 +389,23 @@ void PpsWaveCanvas::setData(const QVector<QString> &names,
 	_time_is_index = time_axis_is_index;
 	_values.resize(_names.size());
 	_valid.resize(_names.size());
+
+	// The painting loops walk the per-channel vectors but index _times with the
+	// same counter, so all three inputs must agree on the sample count. Trim to
+	// the shortest of them instead of reading past the end of _times.
+	int n = _times.size();
+	for (int i = 0; i < _values.size(); ++i)
+		n = std::min(n, _values[i].size());
+	for (int i = 0; i < _valid.size(); ++i)
+		n = std::min(n, _valid[i].size());
+	if (n < 0)
+		n = 0;
+	_times.resize(n);
+	for (int i = 0; i < _values.size(); ++i)
+		_values[i].resize(n);
+	for (int i = 0; i < _valid.size(); ++i)
+		_valid[i].resize(n);
+
 	// Keep the user's visible/hidden choices when the channel set is unchanged.
 	if (_visible.size() != _names.size())
 		_visible.fill(true, _names.size());
@@ -1331,7 +1351,7 @@ void PpsWaveCanvas::paintStacked(QPainter &p, const QRectF &r)
 					const double x = mapTime(_times[i], r);
 					double y = inner_bottom - (v[i] - lo) / (hi - lo) * inner_h;
 					y = std::max(inner_top, std::min(inner_bottom, y));
-					p.drawEllipse(QPointF(x, y), 1.6, 1.6);
+					p.drawEllipse(QPointF(x, y), 2.3, 2.3);
 				}
 				p.setBrush(Qt::NoBrush);
 			}
@@ -1555,7 +1575,7 @@ void PpsWaveCanvas::paintGrid(QPainter &p, const QRectF &r)
 				const double x = mapTime(_times[i], r);
 				double y = inner_bottom - (v[i] - lo) / (hi - lo) * inner_h;
 				y = std::max(inner_top, std::min(inner_bottom, y));
-				p.drawEllipse(QPointF(x, y), 1.5, 1.5);
+				p.drawEllipse(QPointF(x, y), 2.1, 2.1);
 			}
 			p.setBrush(Qt::NoBrush);
 		}
@@ -1829,24 +1849,24 @@ PpsWaveWindow::PpsWaveWindow(pps::PpsManager *manager, QWidget *parent)
 	resize(1100, 660);
 	buildUi();
 
-	_shot_path = QString::fromUtf8(qgetenv("DSVIEW_PPS_WAVE_SHOT"));
-	const QByteArray shot_delay = qgetenv("DSVIEW_PPS_WAVE_SHOT_DELAY");
+	_shot_path = QString::fromUtf8(test_env("DSVIEW_PPS_WAVE_SHOT"));
+	const QByteArray shot_delay = test_env("DSVIEW_PPS_WAVE_SHOT_DELAY");
 	if (!shot_delay.isEmpty())
 		_shot_delay_ms = shot_delay.toInt();
 	// Optional start-up view mode (0 stacked / 1 shared axis / 2 grid).
-	const QByteArray mode_env = qgetenv("DSVIEW_PPS_WAVE_MODE");
+	const QByteArray mode_env = test_env("DSVIEW_PPS_WAVE_MODE");
 	if (!mode_env.isEmpty()) {
 		const int m = mode_env.toInt();
 		if (m >= 0 && m <= 2)
 			_mode_box->setCurrentIndex(m);
 	}
 	// Optional Y-axis outlier clipping percentage, for head-less verification.
-	const QByteArray clip_env = qgetenv("DSVIEW_PPS_WAVE_CLIP");
+	const QByteArray clip_env = test_env("DSVIEW_PPS_WAVE_CLIP");
 	if (!clip_env.isEmpty())
 		_clip_spin->setValue(clip_env.toDouble());
 
 	// Optional CSV to show on open, for verifying the file reader head-lessly.
-	const QString csv = QString::fromUtf8(qgetenv("DSVIEW_PPS_WAVE_CSV"));
+	const QString csv = QString::fromUtf8(test_env("DSVIEW_PPS_WAVE_CSV"));
 	if (!csv.isEmpty()) {
 		QString error;
 		if (openCsv(csv, error)) {
@@ -1854,7 +1874,7 @@ PpsWaveWindow::PpsWaveWindow(pps::PpsManager *manager, QWidget *parent)
 			QTimer::singleShot(_shot_delay_ms, this, [this]() { maybeSaveShot(); });
 			// Head-less benchmark: report the average full repaint cost of the
 			// loaded file, so a big CSV can be compared before/after a change.
-			const QByteArray bench_env = qgetenv("DSVIEW_PPS_WAVE_BENCH");
+			const QByteArray bench_env = test_env("DSVIEW_PPS_WAVE_BENCH");
 			if (!bench_env.isEmpty()) {
 				const int n = std::max(3, bench_env.toInt());
 				QTimer::singleShot(700, this, [this, n]() {
@@ -1888,6 +1908,9 @@ PpsWaveWindow::PpsWaveWindow(pps::PpsManager *manager, QWidget *parent)
 	}
 
 	if (_manager) {
+		// Frames measured before this window existed (the measurement may have
+		// been running for hours) are waiting in the manager's history.
+		seedFromHistory();
 		connect(_manager, &PpsManager::frame_updated,
 				this, &PpsWaveWindow::on_frame_updated);
 		connect(_manager, &PpsManager::status_message,
@@ -1899,7 +1922,7 @@ PpsWaveWindow::PpsWaveWindow(pps::PpsManager *manager, QWidget *parent)
 	// Automation hook: mark a time range as if it had been dragged with Shift,
 	// and write that range out, so the shaded block and the CSV export can be
 	// checked without a mouse.
-	const QString sel_test = QString::fromUtf8(qgetenv("DSVIEW_PPS_WAVE_SEL_TEST"));
+	const QString sel_test = QString::fromUtf8(test_env("DSVIEW_PPS_WAVE_SEL_TEST"));
 	if (!sel_test.isEmpty()) {
 		QTimer::singleShot(6000, this, [this, sel_test]() {
 			QStringList parts = sel_test.split(',');
@@ -1927,7 +1950,7 @@ PpsWaveWindow::PpsWaveWindow(pps::PpsManager *manager, QWidget *parent)
 	// Automation hook: put the hover readout on a frame and keep a copy, so the
 	// readout box can be inspected without moving a mouse.
 	const QString hover_test = QString::fromUtf8(
-		qgetenv("DSVIEW_PPS_WAVE_HOVER_TEST"));
+		test_env("DSVIEW_PPS_WAVE_HOVER_TEST"));
 	if (!hover_test.isEmpty()) {
 		QTimer::singleShot(hover_test.toInt() > 0 ? hover_test.toInt() : 6000,
 				this, [this]() {
@@ -1947,7 +1970,7 @@ PpsWaveWindow::PpsWaveWindow(pps::PpsManager *manager, QWidget *parent)
 
 	// Automation hook: freeze and unfreeze the live view once, to prove that
 	// frames keep being buffered while the view is not following.
-	if (qgetenv("DSVIEW_PPS_WAVE_FOLLOW_TEST") == "1") {
+	if (test_env("DSVIEW_PPS_WAVE_FOLLOW_TEST") == "1") {
 		QTimer::singleShot(5000, this, [this]() {
 			_follow_box->setChecked(false);
 		});
@@ -1958,12 +1981,12 @@ PpsWaveWindow::PpsWaveWindow(pps::PpsManager *manager, QWidget *parent)
 
 	// Automation hook: crank the wheel to maximum zoom-in, then keep a copy of
 	// that frame so the clamped view can be inspected without a mouse.
-	const QString zoom_test = QString::fromUtf8(qgetenv("DSVIEW_PPS_WAVE_ZOOM_TEST"));
+	const QString zoom_test = QString::fromUtf8(test_env("DSVIEW_PPS_WAVE_ZOOM_TEST"));
 	if (!zoom_test.isEmpty()) {
 		// Optional: drop 实时跟随 first, so the zoom survives the next frame the
 		// way a person zooming by hand would experience it.
 		const QString unfollow = QString::fromUtf8(
-			qgetenv("DSVIEW_PPS_WAVE_UNFOLLOW_AT"));
+			test_env("DSVIEW_PPS_WAVE_UNFOLLOW_AT"));
 		if (!unfollow.isEmpty()) {
 			QTimer::singleShot(unfollow.toInt(), this, [this]() {
 				_follow_box->setChecked(false);
@@ -1971,8 +1994,8 @@ PpsWaveWindow::PpsWaveWindow(pps::PpsManager *manager, QWidget *parent)
 		}
 		QTimer::singleShot(zoom_test.toInt() > 0 ? zoom_test.toInt() : 8000,
 				this, [this, zoom_test]() {
-			const double fx = qgetenv("DSVIEW_PPS_WAVE_ZOOM_X").isEmpty()
-				? 0.5 : qgetenv("DSVIEW_PPS_WAVE_ZOOM_X").toDouble();
+			const double fx = test_env("DSVIEW_PPS_WAVE_ZOOM_X").isEmpty()
+				? 0.5 : test_env("DSVIEW_PPS_WAVE_ZOOM_X").toDouble();
 			const QPointF pos(_canvas->width() * fx,
 					_canvas->height() / 2.0);
 			for (int i = 0; i < 60; ++i) {
@@ -2152,6 +2175,53 @@ void PpsWaveWindow::buildUi()
 	connect(_export_btn, &QPushButton::clicked, this, &PpsWaveWindow::onExport);
 
 	_source = QString::fromUtf8("等待测量");
+}
+
+void PpsWaveWindow::seedFromHistory()
+{
+	if (!_manager || _canvas->frameCount() > 0)
+		return;   // a CSV was loaded instead, or frames already arrived
+
+	const std::vector<PpsManager::PpsWaveFrame> &hist = _manager->wave_history();
+	const std::vector<int> &chans = _manager->wave_channels();
+	if (hist.empty() || chans.empty())
+		return;   // no measurement has produced a frame yet
+
+	// The manager buffers every frame from 开始测量, independent of this window,
+	// so replaying it here is what makes a window opened mid-run show the whole
+	// run instead of starting at "now".
+	QVector<QString> names;
+	names.reserve((int)chans.size());
+	for (size_t i = 0; i < chans.size(); ++i)
+		names.append(QString("CH%1").arg(chans[i]));
+
+	_pend_names = names;
+	_pend_t_ms.clear();
+	_pend_t_ms.reserve((int)hist.size());
+	_pend_values.clear();
+	_pend_values.resize(names.size());
+	_pend_valid.clear();
+	_pend_valid.resize(names.size());
+
+	QVector<double> values(names.size());
+	QVector<char> valid(names.size());
+	for (size_t f = 0; f < hist.size(); ++f) {
+		const PpsManager::PpsWaveFrame &fr = hist[f];
+		for (int c = 0; c < names.size(); ++c) {
+			values[c] = ((int)fr.values.size() > c) ? fr.values[c] : 0.0;
+			valid[c] = ((int)fr.valid.size() > c) ? fr.valid[c] : 0;
+		}
+		recordFrame((double)fr.t_ms, names, values, valid);
+	}
+
+	_live_csv = _manager->csv_path();
+	_source = _live_csv.isEmpty()
+		? QString::fromUtf8("实时跟随（自启动测量）")
+		: QString::fromUtf8("实时跟随  %1").arg(QFileInfo(_live_csv).fileName());
+	replayPending();
+	updateInfo();
+	dsv_info("PPS wave: replayed %d frame(s) recorded since the run started",
+		_canvas->frameCount());
 }
 
 void PpsWaveWindow::on_frame_updated()

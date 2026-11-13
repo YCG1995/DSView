@@ -124,6 +124,11 @@ public:
     void attach_decoder(const srd_decoder *dec,
                         const std::map<std::string, int> &probe_ids);
 
+    // Drop option values the reloaded definition no longer declares. A renamed
+    // or removed option would otherwise be handed to srd_inst_new(), which
+    // rejects the whole instance and leaves the decoder with no output.
+    void prune_options(const srd_decoder *dec);
+
 private:
 	const srd_decoder *_decoder;
  

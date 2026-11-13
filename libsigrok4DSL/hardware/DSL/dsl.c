@@ -27,6 +27,13 @@
 #include <assert.h>
 #include <sys/stat.h>
 
+/* Development-only knobs (buffer chunk size / in-flight transfer count read
+ * from the environment). Off in release builds; enable with
+ * -DDSVIEW_DRIVER_TEST_HOOKS=1 when measuring USB throughput. */
+#ifndef DSVIEW_DRIVER_TEST_HOOKS
+#define DSVIEW_DRIVER_TEST_HOOKS 0
+#endif
+
 #undef LOG_PREFIX
 #define LOG_PREFIX "dsl: "
 
@@ -2127,18 +2134,26 @@ static size_t get_buffer_size(const struct sr_dev_inst *sdi)
             s = get_single_buffer_time(devc) * to_bytes_per_ms(devc);
         } else {
             /* Buffer mode: the readout chunk size can be tuned from the
-             * environment so the USB throughput can be measured. */
-            const char *env = getenv("DSVIEW_DSL_BUF_KB");
-            long kb = env ? strtol(env, NULL, 10) : 0;
-            if (kb > 0)
-                s = (size_t)kb * 1024;
-            else if (sdi->mode == LOGIC)
+             * environment so the USB throughput can be measured. This is a
+             * development knob only - enabled with
+             * -DDSVIEW_DRIVER_TEST_HOOKS=1 - and the value is clamped so even
+             * then a stray variable cannot ask for a huge allocation. */
+            size_t chunk = (sdi->mode == LOGIC)
                 /* 2 MB chunks: a 10 MB fresh frame then arrives in ~245 ms
                  * (about 42 MB/s). The long standing 1 MB / 4 in flight
                  * combination measured ~307 ms for the same frame. */
-                s = 2048 * 1024;
-            else
-                s = 1024 * 1024;
+                ? 2048 * 1024
+                : 1024 * 1024;
+#if DSVIEW_DRIVER_TEST_HOOKS
+            const char *env = getenv("DSVIEW_DSL_BUF_KB");
+            long kb = env ? strtol(env, NULL, 10) : 0;
+            if (kb > 0) {
+                if (kb > 16384)
+                    kb = 16384;
+                chunk = (size_t)kb * 1024;
+            }
+#endif
+            s = chunk;
         }
     }
 
@@ -2163,9 +2178,11 @@ static unsigned int get_number_of_transfers(const struct sr_dev_inst *sdi)
     #endif
 
     /* Buffer mode: allow the number of in-flight readout transfers to be
-     * tuned from the environment as well. One transfer at a time is the fast
-     * path for logic readout: every additional queued 1 MB transfer measured
-     * ~50 ms slower per 10 MB frame. */
+     * tuned from the environment as well (development only, see the chunk size
+     * knob above). One transfer at a time is the fast path for logic readout:
+     * every additional queued 1 MB transfer measured ~50 ms slower per 10 MB
+     * frame. */
+#if DSVIEW_DRIVER_TEST_HOOKS
     if (!devc->stream) {
         const char *env = getenv("DSVIEW_DSL_NTRANS");
         long cnt = env ? strtol(env, NULL, 10) : 0;
@@ -2174,6 +2191,10 @@ static unsigned int get_number_of_transfers(const struct sr_dev_inst *sdi)
         else if (sdi->mode == LOGIC)
             n = 1;
     }
+#else
+    if (!devc->stream && sdi->mode == LOGIC)
+        n = 1;
+#endif
 
     if (n > NUM_SIMUL_TRANSFERS)
         return NUM_SIMUL_TRANSFERS;

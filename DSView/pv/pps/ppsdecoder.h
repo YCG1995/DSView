@@ -40,6 +40,10 @@ struct PpsResult
     int channel_index;
     bool valid;
     double delta_ns;   // measured time - reference time, signed
+    // Number of edges of the configured direction inside the capture window
+    // (capped at 2). Only filled when PpsDecoder::decode() was asked to count
+    // them, which the "异常脉冲" DSL save needs; 0 means "not counted".
+    int edge_count;
 };
 
 class PpsDecoder
@@ -53,12 +57,15 @@ public:
     // sample_rate       : Hz
     // ref_trigger_sample: reference trigger position t0 (sample index)
     // channels          : measured channels (reference channel already excluded)
+    // count_edges       : also fill PpsResult::edge_count (needed by the
+    //                     "abnormal pulse" DSL save; costs one extra scan)
     std::vector<PpsResult> decode(
             data::LogicSnapshot *snapshot,
             uint64_t sample_count,
             uint64_t sample_rate,
             uint64_t ref_trigger_sample,
-            const std::vector<PpsChannel> &channels);
+            const std::vector<PpsChannel> &channels,
+            bool count_edges = false);
 
     // Level of a channel at a sample (false=low, true=high).
     static bool level(data::LogicSnapshot *snapshot,

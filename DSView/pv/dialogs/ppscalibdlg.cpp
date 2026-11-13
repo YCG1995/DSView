@@ -2,6 +2,7 @@
  * Calibration dialog implementation.
  */
 #include "ppscalibdlg.h"
+#include "../pps/ppstesthooks.h"
 
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -36,7 +37,7 @@ PpsCalibDlg::PpsCalibDlg(SigSession *session, int default_channel,
 	_count_spin = new QSpinBox(box);
 	_count_spin->setRange(1, 100);
 	// Head-less checks can shorten the series without clicking the spin box.
-	const int count_override = qgetenv("DSVIEW_PPS_CALIB_COUNT").toInt();
+	const int count_override = test_env("DSVIEW_PPS_CALIB_COUNT").toInt();
 	_count_spin->setValue(count_override > 0 ? count_override : 10);
 	form->addRow(QString::fromUtf8("采集次数"), _count_spin);
 

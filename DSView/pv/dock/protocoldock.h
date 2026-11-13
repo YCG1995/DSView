@@ -88,6 +88,12 @@ public:
     void reset_view();
     void update_view_status();
 
+    // The per-decoder run button is only useful while the decoder debug console
+    // is open (its print() output is what the user wants to see). The main
+    // window calls this whenever that dock is shown or hidden.
+    void set_run_buttons_visible(bool visible);
+    inline bool run_buttons_visible(){ return _run_buttons_visible; }
+
 private:
     void retranslateUi();
     void reStyle();
@@ -103,6 +109,7 @@ private:
     void OnProtocolSetting(void *handle) override;
     void OnProtocolDelete(void *handle) override;
     void OnProtocolFormatChanged(QString format, void *handle) override;
+    void OnProtocolRun(void *handle) override;
 
     //IKeywordActive
     void BeginEditKeyword() override; 
@@ -122,6 +129,7 @@ private:
 
 signals:
     void protocol_updated();
+    void sig_show_console();
 
 public slots:
     void update_model();
@@ -159,6 +167,7 @@ private:
     QLabel *_bot_title_label;
 
     QPushButton *_pro_add_button;
+    QPushButton *_console_button;
     QPushButton *_del_all_button; 
     QVBoxLayout *_top_layout;
     std::vector <ProtocolItemLayer*> _protocol_lay_items; //protocol item layers
@@ -174,6 +183,7 @@ private:
 
     mutable std::mutex _search_mutex;
     bool _search_edited; 
+    bool _run_buttons_visible = false;
 };
 
 } // namespace dock

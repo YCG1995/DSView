@@ -38,6 +38,10 @@
 #include <QPainterPath> 
 #include <math.h>
 #include <QWheelEvent>
+#if defined(Q_OS_ANDROID)
+#include <QTouchEvent>
+#include <QLineF>
+#endif
  
 #include "../config/appconfig.h"
 #include "../dsvdef.h"
@@ -80,6 +84,16 @@ Viewport::Viewport(View &parent, View_type type) :
 	setMouseTracking(true);
 	setAutoFillBackground(true);
     setBackgroundRole(QPalette::Base);
+
+#if defined(Q_OS_ANDROID)
+    /* 触屏：接管触摸事件，单指拖动平移、双指捏合缩放。
+     * 不设置 WA_AcceptTouchEvents 的话，Qt 只会合成鼠标事件，
+     * 手机上就只能拖动、没法缩放。 */
+    setAttribute(Qt::WA_AcceptTouchEvents, true);
+#endif
+    _touch_active = false;
+    _touch_fingers = 0;
+    _touch_last_dist = 0;
 
     //setFixedSize(QSize(600, 400));
     _mm_width = View::Unknown_Str;
@@ -146,7 +160,116 @@ bool Viewport::event(QEvent *event)
 {
     if (event->type() == QEvent::NativeGesture)
         return gestureEvent(static_cast<QNativeGestureEvent*>(event));
+#if defined(Q_OS_ANDROID)
+    if (event->type() == QEvent::TouchBegin ||
+        event->type() == QEvent::TouchUpdate ||
+        event->type() == QEvent::TouchEnd ||
+        event->type() == QEvent::TouchCancel) {
+        handle_touch(event);
+        return true;
+    }
+#endif
     return QWidget::event(event);
+}
+
+/* 手机触屏手势：
+ *   单指左右拖动  -> 水平平移（等价于鼠标左键拖动）
+ *   双指捏合/张开 -> 缩放（以两指中心为锚点）
+ *   FFT 视图下双指横向拖动 -> 频谱平移
+ */
+void Viewport::handle_touch(QEvent *event)
+{
+#if defined(Q_OS_ANDROID)
+    auto *te = static_cast<QTouchEvent*>(event);
+    const QList<QTouchEvent::TouchPoint> points = te->points();
+
+    int active = 0;
+    for (const auto &p : points) {
+        if (p.state() != Qt::TouchPointReleased)
+            active++;
+    }
+
+    if (event->type() == QEvent::TouchEnd || event->type() == QEvent::TouchCancel) {
+        _touch_active = false;
+        _touch_fingers = 0;
+        _touch_last_dist = 0;
+        return;
+    }
+
+    if (points.isEmpty())
+        return;
+
+    if (active >= 2) {
+        /* ---- 双指缩放 ---- */
+        const QTouchEvent::TouchPoint &a = points.at(0);
+        const QTouchEvent::TouchPoint &b = points.at(points.size() > 1 ? 1 : 0);
+        QPointF center = (a.position() + b.position()) / 2;
+        qreal dist = QLineF(a.position(), b.position()).length();
+
+        if (!_touch_active || _touch_fingers < 2) {
+            _touch_active = true;
+            _touch_fingers = 2;
+            _touch_last_dist = dist;
+            _touch_last_pos = center;
+            return;
+        }
+
+        if (_touch_last_dist > 4 && dist > 4) {
+            /* View::zoom 的刻度是 1.5 的幂：scale *= 1.5^-steps，
+             * 所以两指张开 n 倍 -> steps = -log(n)/log(1.5) */
+            double ratio = dist / _touch_last_dist;
+            double steps = -std::log(ratio) / std::log(1.5);
+            if (qAbs(steps) > 0.01) {
+                if (_type == FFT_VIEW) {
+                    for (auto t : _view.session().get_spectrum_traces()) {
+                        if (t->enabled()) {
+                            t->zoom(steps, (int)center.x());
+                            break;
+                        }
+                    }
+                }
+                else {
+                    _view.zoom(steps, (int)center.x());
+                }
+            }
+        }
+        _touch_last_dist = dist;
+        _touch_last_pos = center;
+        return;
+    }
+
+    /* ---- 单指平移 ---- */
+    const QTouchEvent::TouchPoint &p0 = points.at(0);
+    QPointF pos = p0.position();
+
+    if (!_touch_active || _touch_fingers != 1) {
+        _touch_active = true;
+        _touch_fingers = 1;
+        _touch_last_pos = pos;
+        _mouse_down_offset = _view.offset();
+        return;
+    }
+
+    int dx = (int)(_touch_last_pos.x() - pos.x());
+    if (dx != 0) {
+        if (_type == TIME_VIEW) {
+            _view.set_scale_offset(_view.scale(), _mouse_down_offset + dx);
+            /* 平滑惯性：持续拖动时不断累计，避免松手后回弹 */
+            _mouse_down_offset = _view.offset();
+        }
+        else if (_type == FFT_VIEW) {
+            for (auto t : _view.session().get_spectrum_traces()) {
+                if (t->enabled()) {
+                    t->set_offset(dx);
+                    break;
+                }
+            }
+        }
+        _touch_last_pos = pos;
+    }
+#else
+    Q_UNUSED(event);
+#endif
 }
 
 void Viewport::paintEvent(QPaintEvent *event)

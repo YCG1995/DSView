@@ -118,6 +118,11 @@ ProtocolDock::ProtocolDock(QWidget *parent, view::View &view, SigSession *sessio
 
     _pro_add_button = new QPushButton(top_panel);
     _pro_add_button->setFlat(true);
+    _console_button = new QPushButton(top_panel);
+    _console_button->setFlat(true);
+    _console_button->setToolTip(tr("打开解码调试控制台（脚本 print 输出 / 异常 traceback / 区间快解）"));
+    connect(_console_button, &QPushButton::clicked, this,
+            [this](){ emit sig_show_console(); });
     _del_all_button = new QPushButton(top_panel);
     _del_all_button->setFlat(true);
     _del_all_button->setCheckable(true);
@@ -128,6 +133,7 @@ ProtocolDock::ProtocolDock(QWidget *parent, view::View &view, SigSession *sessio
     QHBoxLayout *pro_search_lay = new QHBoxLayout();
     pro_search_lay->setSpacing(2);
     pro_search_lay->addWidget(_pro_add_button);
+    pro_search_lay->addWidget(_console_button);
     pro_search_lay->addWidget(_del_all_button);
     pro_search_lay->addWidget(_pro_keyword_edit, 1); 
     pro_search_lay->addWidget(_pro_search_button);
@@ -256,6 +262,7 @@ void ProtocolDock::reStyle()
     }
 
     _pro_add_button->setIcon(QIcon(iconPath+"/add.svg"));
+    _console_button->setIcon(QIcon(iconPath+"/log.svg"));
     _del_all_button->setIcon(QIcon(iconPath+"/del.svg"));
     _bot_set_button->setIcon(QIcon(iconPath+"/gear.svg"));
     _bot_save_button->setIcon(QIcon(iconPath+"/save.svg"));
@@ -362,6 +369,14 @@ bool ProtocolDock::add_protocol_by_id(QString id, bool silent, std::list<pv::dat
         return false;
     }
 
+    // A running 1PPS measurement uses its own synchronous C decoder and owns the
+    // capture loop; generic Python decoders are not allowed to join it.
+    if (_session->generic_decode_blocked()) {
+        MsgBox::Show(L_S(STR_PAGE_MSG, S_ID(IDS_MSG_ERROR), "error"),
+            _session->generic_decode_block_reason(), this);
+        return false;
+    }
+
     int dex = this->get_protocol_index_by_id(id);
     if (dex == -1){
         dsv_err("Protocol not exists! id:%s", id.toUtf8().data());
@@ -395,6 +410,7 @@ bool ProtocolDock::add_protocol_by_id(QString id, bool silent, std::list<pv::dat
     layer->m_decoderStatus = dstatus; 
     layer->m_protocolId = protocolId;
     layer->_trace = trace;
+    layer->set_run_visible(_run_buttons_visible);
 
     // set current protocol format
     string fmt = AppConfig::Instance().GetProtocolFormat(protocolId.toStdString());
@@ -853,6 +869,27 @@ void ProtocolDock::search_update()
 }
 
  //-------------------IProtocolItemLayerCallback
+void ProtocolDock::set_run_buttons_visible(bool visible)
+{
+    _run_buttons_visible = visible;
+
+    for (auto layer : _protocol_lay_items)
+        layer->set_run_visible(visible);
+}
+
+//-------------------IProtocolItemLayerCallback
+void ProtocolDock::OnProtocolRun(void *handle){
+
+    for (auto it = _protocol_lay_items.begin(); it != _protocol_lay_items.end(); it++){
+       if ((*it) == handle){
+           void *key_handel = (*it)->get_protocol_key_handel();
+           _session->rerun_decoder_by_key_handel(key_handel);
+           protocol_updated();
+           break;
+       }
+   }
+}
+
 void ProtocolDock::OnProtocolSetting(void *handle){
   
     for (auto it = _protocol_lay_items.begin(); it != _protocol_lay_items.end(); it++){

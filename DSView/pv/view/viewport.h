@@ -142,6 +142,9 @@ private:
     void resizeEvent(QResizeEvent *e) override;
     bool gestureEvent(QNativeGestureEvent *event);
 
+    /* 触屏手势（手机/平板）：单指拖动平移，双指捏合缩放 */
+    void handle_touch(QEvent *event);
+
     void paintSignals(QPainter& p, QColor fore, QColor back);
     void paintProgress(QPainter& p, QColor fore, QColor back);
     void paintMeasure(QPainter &p, QColor fore, QColor back);
@@ -242,6 +245,12 @@ private:
     int             _tigger_wait_times;
     QAction         *_yAction;
     QAction         *_xAction;
+
+    /* --- 触屏手势状态 --- */
+    bool        _touch_active;
+    int         _touch_fingers;
+    QPointF     _touch_last_pos;      // 单指/双指中心的上一次位置
+    qreal       _touch_last_dist;     // 双指间距（用于捏合比例）
 };
 
 } // namespace view

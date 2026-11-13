@@ -218,14 +218,44 @@ srd_decoder_inst* Decoder::create_decoder_inst(srd_session *session){
 	{
         GVariant *const gvar = g_variant_new_int32((*it).second);
 		g_variant_ref_sink(gvar);
-		g_hash_table_insert(probes, (*it).first->id, gvar);
+		// The table frees its keys, so hand it a copy: the channel id
+		// belongs to the decoder definition and must survive.
+		g_hash_table_insert(probes, g_strdup((*it).first->id), gvar);
 	}
 
     srd_inst_channel_set_all(decoder_inst, probes);
 
 	return decoder_inst;
 }
- 
+
+void Decoder::prune_options(const srd_decoder *dec)
+{
+    if (!dec)
+        return;
+
+    // _options_back owns the references (see commit(): _options only borrows
+    // them), so a value has to be removed there to stay removed.
+    std::map<std::string, bool> known;
+    for (GSList *l = dec->options; l; l = l->next) {
+        const srd_decoder_option *o = (const srd_decoder_option *)l->data;
+        if (o && o->id)
+            known[o->id] = true;
+    }
+
+    for (auto it = _options_back.begin(); it != _options_back.end(); ) {
+        if (!known.count(it->first)) {
+            dsv_info("decoder option '%s' is not declared by the reloaded "
+                     "script, dropped", it->first.c_str());
+            if (it->second)
+                g_variant_unref(it->second);
+            it = _options_back.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    _options = _options_back;
+}
 
 } // decode
 } // data

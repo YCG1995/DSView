@@ -27,6 +27,7 @@
 #include "mainwindow.h"
 
 #include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QEvent>
 #include <QMouseEvent>
 #include <QHoverEvent>
@@ -673,6 +674,31 @@ void MainFrame::ShowFormInit()
     isWin32 = true;
 #endif
 
+#if defined(Q_OS_ANDROID)
+    /* 手机：直接用整块可用屏幕，不要沿用桌面保存的窗口尺寸
+     * （否则窗口比屏幕窄/高，右侧留一条空带、内容被挤出屏外） */
+    {
+        QScreen *scr = QGuiApplication::primaryScreen();
+        if (scr) {
+            QRect avail = scr->availableGeometry();
+            qWarning("ANDROID-GEO avail=%dx%d dpr=%.2f  frame=%dx%d",
+                     avail.width(), avail.height(), scr->devicePixelRatio(),
+                     width(), height());
+            move(avail.topLeft());
+            showMaximized();
+            QTimer::singleShot(500, this, [this]() {
+                qWarning("ANDROID-GEO after show frame=%dx%d window=%dx%d geo=%d,%d",
+                         width(), height(),
+                         _mainWindow ? _mainWindow->width() : -1,
+                         _mainWindow ? _mainWindow->height() : -1,
+                         pos().x(), pos().y());
+            });
+            QFrame::show();
+            return;
+        }
+    }
+#endif
+
     if (_initWndInfo.isMaxSize){
         move(x, y);
         if (isWin32 &&_is_win32_parent_window){
@@ -1066,7 +1092,71 @@ void MainFrame::show_doc()
         }
 
         QLabel tipsLabel;
+#if defined(Q_OS_ANDROID)
+        {
+            /* 说明图是桌面尺寸的 PNG，手机上会撑爆屏幕、按钮被挤到屏幕外。
+             * 这里按屏宽等比缩放。 */
+            QScreen *scr = QGuiApplication::primaryScreen();
+            QRect avail = scr ? scr->availableGeometry() : QRect(0, 0, 400, 800);
+            QPixmap pm(path);
+            if (!pm.isNull()) {
+                int maxW = (int)(avail.width() * 0.86);
+                int maxH = (int)(avail.height() * 0.62);
+                if (pm.width() > maxW || pm.height() > maxH)
+                    pm = pm.scaled(maxW, maxH, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+                tipsLabel.setPixmap(pm);
+            }
+
+            /* 手机上不用 QMessageBox（它自带一个窗口，和嵌进布局的实例
+             * 会画出两套按钮）。改成一行三个按钮，跟着对话框一起排。 */
+            int result = 0;  // 0=Ignore 1=NotShowAgain 2=Open
+
+            /* 布局对象必须堆分配：addLayout() 会把所有权交给父布局，
+             * 栈对象会在两个析构路径上被 delete 两次（android 上表现为
+             * Scudo "corrupted chunk header" 直接 abort）。 */
+            QHBoxLayout *btnRow = new QHBoxLayout();
+            QPushButton *noMoreBtn = new QPushButton(
+                L_S(STR_PAGE_MSG, S_ID(IDS_MSG_NOT_SHOW_AGAIN), "Not Show Again"));
+            QPushButton *ignoreBtn = new QPushButton(
+                L_S(STR_PAGE_MSG, S_ID(IDS_MSG_IGNORE), "Ignore"));
+            QPushButton *openBtn = new QPushButton(
+                L_S(STR_PAGE_MSG, S_ID(IDS_MSG_OPEN), "Open"));
+            btnRow->addStretch(1);
+            btnRow->addWidget(noMoreBtn);
+            btnRow->addWidget(ignoreBtn);
+            btnRow->addWidget(openBtn);
+
+            QObject::connect(noMoreBtn, &QPushButton::clicked, &dlg, [&result, &dlg]() {
+                result = 1; dlg.done(0);
+            });
+            QObject::connect(ignoreBtn, &QPushButton::clicked, &dlg, [&result, &dlg]() {
+                result = 0; dlg.done(0);
+            });
+            QObject::connect(openBtn, &QPushButton::clicked, &dlg, [&result, &dlg]() {
+                result = 2; dlg.done(0);
+            });
+
+            QVBoxLayout *layout = new QVBoxLayout();
+            layout->addWidget(&tipsLabel);
+            layout->addLayout(btnRow);
+            layout->setContentsMargins(0, 0, 0, 0);
+            layout->setSpacing(10);
+            dlg.layout()->addLayout(layout);
+
+            dlg.exec();
+
+            if (result == 2) {
+                _mainWindow->openDoc();
+            }
+            if (result == 1) {
+                app.userHistory.showDocuments = false;
+                app.SaveHistory();
+            }
+            return;
+        }
+#else
         tipsLabel.setPixmap(path);
+#endif
 
         QMessageBox msg;
         msg.setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint | Qt::WindowSystemMenuHint);
@@ -1076,12 +1166,13 @@ void MainFrame::show_doc()
         msg.addButton(L_S(STR_PAGE_MSG, S_ID(IDS_MSG_IGNORE), "Ignore"), QMessageBox::ActionRole);
         QPushButton *openButton = msg.addButton(L_S(STR_PAGE_MSG, S_ID(IDS_MSG_OPEN), "Open"), QMessageBox::ActionRole);
 
-        QVBoxLayout layout;
-        layout.addWidget(&tipsLabel);
-        layout.addWidget(&msg, 0, Qt::AlignRight);
-        layout.setContentsMargins(0, 0, 0, 0);
+        /* 同样必须堆分配（addLayout 会接管所有权） */
+        QVBoxLayout *layout = new QVBoxLayout();
+        layout->addWidget(&tipsLabel);
+        layout->addWidget(&msg, 0, Qt::AlignRight);
+        layout->setContentsMargins(0, 0, 0, 0);
 
-        dlg.layout()->addLayout(&layout);
+        dlg.layout()->addLayout(layout);
         connect(&msg, SIGNAL(buttonClicked(QAbstractButton*)), &dlg, SLOT(accept()));
 
         dlg.exec();

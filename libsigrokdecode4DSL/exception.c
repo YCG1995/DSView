@@ -96,7 +96,7 @@ SRD_PRIV void srd_exception_catch(char **error, const char *format, ...)
 	char *msg, *etype_name, *evalue_str, *outstr;
 	const char *etype_name_fallback;
 	PyGILState_STATE gstate;
-	GString *s;
+	GString *s = NULL;
 	char *final_msg;
 
 	py_etype = py_evalue = py_etraceback = py_mod = py_func = NULL;
@@ -157,13 +157,20 @@ SRD_PRIV void srd_exception_catch(char **error, const char *format, ...)
 		}
 	}
 	srd_err("%s", s->str);
-	g_string_free(s, TRUE);
 
 	Py_DECREF(py_tracefmt);
 
 cleanup:
-	if (error)
-		*error = g_strdup(final_msg);
+	if (error) {
+		/* Keep the formatted traceback in the error text so the UI can
+		 * show file:line instead of a bare exception name. */
+		if (s && s->str && *s->str)
+			*error = g_strdup_printf("%s\n%s", final_msg, s->str);
+		else
+			*error = g_strdup(final_msg);
+	}
+	if (s)
+		g_string_free(s, TRUE);
 	Py_XDECREF(py_func);
 	Py_XDECREF(py_mod);
 	Py_XDECREF(py_etraceback);

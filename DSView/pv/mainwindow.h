@@ -25,6 +25,7 @@
 #define DSVIEW_PV_MAINWINDOW_H
 
 #include <list>
+#include <vector>
 #include <QMainWindow>
 #include <QTranslator> 
 #include "dialogs/dsmessagebox.h"
@@ -32,6 +33,7 @@
 #include "eventobject.h" 
 #include "mcp/mcpserver.h"
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <chrono>
 #include <QTimer>
 #include <QPointer>
@@ -59,6 +61,7 @@ class AutoSaveManager;
 namespace mcp {
 class McpServer;
 class IPpsControl;
+class IConsoleTextProvider;
 }
 
 namespace pps {
@@ -80,6 +83,7 @@ class TriggerDock;
 class DsoTriggerDock;
 class MeasureDock;
 class SearchDock;
+class DecoderConsoleDock;
 class PpsResultDock;
 }
 
@@ -95,7 +99,8 @@ class MainWindow :
     public IMainForm,
     public ISessionDataGetter,
     public IMessageListener,
-    public mcp::IPpsControl
+    public mcp::IPpsControl,
+    public mcp::IConsoleTextProvider
 {
 	Q_OBJECT
 
@@ -169,12 +174,23 @@ public:
     void pps_stop() override;
     QJsonObject pps_status() override;
 
+    //mcp::IConsoleTextProvider — what the decoder console window currently shows.
+    QString console_text() const override;
+
 private: 
 	void setup_ui();
     void retranslateUi(); 
+    // 显示/隐藏右侧面板；Android 下展开时按屏宽铺满（桌面按原尺寸）
+    void show_side_dock(QDockWidget *dock, bool visible);
     // Enables exactly the PPS channel set on the main capture, so the main view
     // matches what the 1PPS measurement samples.
     void apply_pps_channels_to_session();
+    // 1PPS 借用设备时会按自己的通道集重写使能位；测完/校准完必须还原成用户
+    // 进入 1PPS 之前的状态，否则界面显示的通道数与驱动实际不一致。
+    void save_channels_before_pps();
+    void restore_channels_after_pps();
+    std::vector<char> _pps_saved_channels;
+    bool _pps_channels_saved = false;
     bool eventFilter(QObject *object, QEvent *event);
     void check_usb_device_speed();
     void reset_all_view();
@@ -264,6 +280,8 @@ private:
     dock::MeasureDock       *_measure_widget;
     QDockWidget             *_search_dock;
     dock::SearchDock        *_search_widget;
+    QDockWidget                 *_decoder_console_dock;
+    dock::DecoderConsoleDock    *_decoder_console_widget;
 
     QTranslator     _qtTrans;
     QTranslator     _myTrans;
@@ -280,6 +298,10 @@ private:
     high_resolution_clock::time_point _last_key_press_time;
     bool            _is_save_confirm_msg;
     QString         _pattern_mode;
+    // Decoders that were active before the last device switch. A data file that
+    // carries no decoder section (autosave frames, raw exports) falls back to
+    // these, so opening a saved capture still decodes instead of showing nothing.
+    QJsonArray      _last_decoder_json;
     QWidget         *_frame;
     DsTimer         _delay_prop_msg_timer;
     QString         _strMsg;

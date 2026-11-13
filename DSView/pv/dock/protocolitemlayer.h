@@ -43,6 +43,10 @@ class IProtocolItemLayerCallback
         virtual void OnProtocolSetting(void *handle)=0;
         virtual void OnProtocolDelete(void *handle)=0;
         virtual void OnProtocolFormatChanged(QString format, void *handle)=0;
+        // Re-run this decoder on the data that is already in the buffer.
+        // Only reachable from the run button, which is shown while the decoder
+        // debug console is open.
+        virtual void OnProtocolRun(void *handle)=0;
 };
 
 class ProtocolItemLayer: public QHBoxLayout
@@ -68,11 +72,17 @@ public:
     void set_label_name(QString name);
 
     void update_font();
+
+    // The run button only makes sense while the decoder debug console is open:
+    // the user needs to see the script's print() output it produces.
+    void set_run_visible(bool visible);
+    inline bool run_visible(){ return _run_visible; }
   
 private slots: 
     void on_set_protocol(); 
     void on_del_protocol();
     void on_format_select_changed(int index);
+    void on_run_protocol();
 
 public:
     DecoderStatus *m_decoderStatus; //DecoderStatus
@@ -83,12 +93,14 @@ private:
     QLabel *_protocol_label;
     QLabel *_progress_label;
     QPushButton *_set_button;
+    QPushButton *_run_button;
     QPushButton *_del_button;
     DsComboBox  *_format_combox;
     IProtocolItemLayerCallback *m_callback;
     QString     _protocolName; //the lable text
     bool        m_bSetting;
     bool        m_singleFlag; 
+    bool        _run_visible;
 };
 
  } //dock

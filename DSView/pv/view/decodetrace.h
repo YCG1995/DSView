@@ -128,12 +128,25 @@ public:
  
     int rows_size();
 
+    /**
+     * Double-clicking an error banner opens the full message (traceback,
+     * script path and line number) in a scrollable dialog.
+     */
+    bool mouse_double_click(int right, const QPoint pt) override;
+
     QRectF get_rect(DecodeSetRegions type, int y, int right);
 
     /**
      * decode region
      **/
     void frame_ended();
+
+    /**
+     * Push the decoded sample range down to every decoder before a decode
+     * starts. Without this, a decoder added while no frame-end has been
+     * delivered keeps its 0..0 default region and only "decodes" one sample.
+     */
+    void prepare_decode_region();
 
     int get_progress();
 

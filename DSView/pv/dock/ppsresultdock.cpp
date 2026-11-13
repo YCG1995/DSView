@@ -4,18 +4,27 @@
 #include "ppsresultdock.h"
 #include "../pps/ppsmanager.h"
 #include "../config/appconfig.h"
+#include "../log.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QDesktopServices>
+#include <QFileInfo>
 #include <QHeaderView>
 #include <QMap>
 #include <QBrush>
 #include <QColor>
+#include <QDir>
 #include <QIcon>
 #include <QPainter>
 #include <QPixmap>
+#include <QProcess>
 #include <QSize>
 #include <QSizePolicy>
+#include <QSignalBlocker>
+#include <QTimer>
+#include <QCoreApplication>
+#include <QUrl>
 #include <algorithm>
 
 // Qt's automatic "disabled" rendering of an SVG icon is barely visible on this
@@ -96,21 +105,47 @@ PpsResultDock::PpsResultDock(pps::PpsManager *manager, QWidget *parent)
 	buttons->addWidget(_config_btn);
 	buttons->addWidget(_start_btn);
 	buttons->addWidget(_stop_btn);
+
+	// "自动保存波形" sits right of 停止 so it can be flipped while a measurement
+	// is running: every trigger then writes its raw frame as a DSL file. It used
+	// to be the "无条件保存" tick of the configuration dialog, which could only be
+	// changed before a run started.
+	_autosave_chk = new QCheckBox(QString::fromUtf8("自动保存波形"), _host);
+	_autosave_chk->setObjectName("ppsAutosaveCheck");
+	_autosave_chk->setToolTip(QString::fromUtf8(
+		"勾选后每一次触发都把原始帧保存成 DSL 文件（每个 CSV 旁边一个同名文件夹）。"
+		"测量运行中也可以随时切换。"));
+	_autosave_chk->setChecked(_manager->dsl_save_always());
+	buttons->addSpacing(8);
+	buttons->addWidget(_autosave_chk);
+
 	buttons->addSpacing(12);
 	buttons->addWidget(_calib_btn);
 	buttons->addWidget(_wave_btn);
 	buttons->addStretch(1);
 	layout->addLayout(buttons);
 
-	_frame_label = new QLabel(QString::fromUtf8("帧数: 0"), _host);
-	layout->addWidget(_frame_label);
+	// One line instead of three stacked labels: frames, round-trip time and the
+	// CSV file name, with the button that opens the result next to it. The full
+	// path and the capture/report split live in the tooltip, where they do not
+	// push the table off the dock.
+	QHBoxLayout *info_row = new QHBoxLayout();
+	info_row->setSpacing(8);
+	_info_label = new QLabel(_host);
+	_info_label->setObjectName("ppsCsvLabel");
+	_info_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	_info_label->setWordWrap(false);
+	_info_label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+	_info_label->setText(QString::fromUtf8("帧数:0  耗时:—  测试时长:00:00"));
+	info_row->addWidget(_info_label, 1);
 
-	// How long one measurement round trip takes: the capture window plus the
-	// time the samples need to come over USB and be decoded.
-	_timing_label = new QLabel(QString::fromUtf8("本次耗时: —"), _host);
-	_timing_label->setToolTip(QString::fromUtf8(
-		"采集 = 采集时间窗口；上报 = 从触发到数据搬完并解码完成的时间。"));
-	layout->addWidget(_timing_label);
+	_open_btn = new QPushButton(QString::fromUtf8("打开文件"), _host);
+	_open_btn->setObjectName("ppsOpenFileButton");
+	_open_btn->setToolTip(QString::fromUtf8(
+		"打开结果 CSV 所在文件夹，并在其中选中该文件"));
+	_open_btn->setEnabled(false);
+	info_row->addWidget(_open_btn);
+	layout->addLayout(info_row);
 
 	_table = new QTableWidget(_host);
 	_table->setColumnCount(7);
@@ -129,14 +164,8 @@ PpsResultDock::PpsResultDock(pps::PpsManager *manager, QWidget *parent)
 	layout->addWidget(_table);
 
 	// Where the current run is being written: asked for explicitly so the CSV
-	// can be found while a measurement is still running.
-	_csv_label = new QLabel(_host);
-	_csv_label->setObjectName("ppsCsvLabel");
-	_csv_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
-	_csv_label->setWordWrap(false);
-	_csv_label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-	_csv_label->setText(QString::fromUtf8("正在保存的 CSV: —"));
-	layout->addWidget(_csv_label);
+	// can be found while a measurement is still running. It sits above the table
+	// because below it the dock's height cut it off the screen.
 	layout->addStretch(1);
 
 	connect(_manager, &pps::PpsManager::frame_updated,
@@ -151,6 +180,23 @@ PpsResultDock::PpsResultDock(pps::PpsManager *manager, QWidget *parent)
 		this, &PpsResultDock::calib_requested);
 	connect(_wave_btn, &QToolButton::clicked,
 		this, &PpsResultDock::wave_requested);
+	connect(_open_btn, &QPushButton::clicked,
+		this, &PpsResultDock::on_open_file);
+	connect(_autosave_chk, &QCheckBox::toggled, this, [this](bool on) {
+		// Applied to the running measurement immediately: the tick decides
+		// whether the next trigger writes a DSL, not whether the run was started
+		// with it.
+		_manager->set_dsl_save_always(on);
+	});
+	// "测试时长" has to run even when no frame arrives (a 1 Hz reference means
+	// one frame per second), so the label is refreshed on its own clock.
+	_run_tick = new QTimer(this);
+	_run_tick->setInterval(1000);
+	connect(_run_tick, &QTimer::timeout, this, [this]() {
+		if (_manager->is_running())
+			update_info_line();
+	});
+	_run_tick->start();
 	refresh();
 }
 
@@ -161,6 +207,62 @@ static QString fmt(double v)
 	if (s == "-0.0")
 		s = "0.0";
 	return s;
+}
+
+// Run duration, readable at a glance: mm:ss, or h:mm:ss once it passes an hour.
+static QString fmtDuration(qint64 ms)
+{
+	if (ms < 0)
+		ms = 0;
+	const qint64 total_s = ms / 1000;
+	const qint64 h = total_s / 3600;
+	const qint64 m = (total_s % 3600) / 60;
+	const qint64 s = total_s % 60;
+	if (h > 0)
+		return QString("%1:%2:%3").arg(h)
+			.arg(m, 2, 10, QChar('0')).arg(s, 2, 10, QChar('0'));
+	return QString("%1:%2").arg(m, 2, 10, QChar('0'))
+		.arg(s, 2, 10, QChar('0'));
+}
+
+void PpsResultDock::update_info_line()
+{
+	// Single summary line. The frame count and the round-trip time are plain
+	// numbers here; the breakdown (capture vs. report), the run duration and the
+	// absolute path are in the tooltip, so the line stays short enough to keep
+	// the file name readable next to the "打开文件" button.
+	const int frames = _manager->frame_count();
+	const QString csv = _manager->csv_path();
+	const QString file_name = csv.isEmpty()
+		? QString::fromUtf8("—") : QFileInfo(csv).fileName();
+	QString cost = QString::fromUtf8("—");
+	QString breakdown = QString::fromUtf8("尚未开始测量。");
+	if (frames > 0) {
+		// Whole milliseconds: a per-frame breakdown to 0.1 ms in the summary line
+		// was noise, the tooltip keeps the exact split.
+		cost = QString::number(qRound(_manager->last_total_ms())) + " ms";
+		breakdown = QString::fromUtf8(
+			"采集 %1 ms + 上报 %2 ms = 共 %3 ms")
+			.arg(fmt(_manager->last_capture_ms()))
+			.arg(fmt(_manager->last_report_ms()))
+			.arg(fmt(_manager->last_total_ms()));
+	}
+	// 测试时长: wall time since 开始测量, frozen once the run stops.
+	const QString elapsed = fmtDuration(_manager->run_elapsed_ms());
+	const QString full = QString::fromUtf8("帧数:%1  耗时:%2  测试时长:%3  %4")
+		.arg(frames).arg(cost).arg(elapsed).arg(file_name);
+	const int room = std::max(220, _host->width() - 40);
+	QString info = _info_label->fontMetrics().elidedText(
+			full, Qt::ElideMiddle, room);
+	if (info != _info_shown) {
+		_info_shown = info;
+		_info_label->setText(info);
+	}
+	QString tip = breakdown;
+	tip += QString::fromUtf8("\n测试时长：%1").arg(elapsed);
+	if (!csv.isEmpty())
+		tip += QString::fromUtf8("\n结果文件：%1").arg(csv);
+	_info_label->setToolTip(tip);
 }
 
 void PpsResultDock::refresh()
@@ -179,8 +281,23 @@ void PpsResultDock::refresh()
 	for (const pps::PpsStats &s : stats)
 		stats_map.insert(s.channel_index, s);
 
-	_frame_label->setText(QString::fromUtf8("帧数: ")
-		+ QString::number(_manager->frame_count()));
+	// Single summary line (frames / 耗时 / 测试时长 / file name).
+	update_info_line();
+	const QString csv = _manager->csv_path();
+	const QString file_name = csv.isEmpty()
+		? QString::fromUtf8("—") : QFileInfo(csv).fileName();
+	// Nothing to reveal before the first frame has opened a file.
+	_open_btn->setEnabled(!csv.isEmpty());
+	_open_btn->setToolTip(csv.isEmpty()
+		? QString::fromUtf8("还没有结果文件，开始测量后可用")
+		: QString::fromUtf8(
+			"打开结果所在文件夹并选中：%1").arg(file_name));
+	// The tick is the single source of truth for 无条件保存; the dialog no
+	// longer edits it, so it can only drift if something else sets the config.
+	{
+		const QSignalBlocker block(_autosave_chk);
+		_autosave_chk->setChecked(_manager->dsl_save_always());
+	}
 	const bool running = _manager->is_running();
 	_start_btn->setEnabled(!running);
 	_stop_btn->setEnabled(running);
@@ -193,36 +310,6 @@ void PpsResultDock::refresh()
 	_calib_btn->setToolTip(running
 		? QString::fromUtf8("测量运行中不可校准，请先停止测量")
 		: QString::fromUtf8("校准…"));
-
-	if (_manager->frame_count() > 0) {
-		_timing_label->setText(QString::fromUtf8(
-			"本次耗时: 采集 %1 ms + 上报 %2 ms = 共 %3 ms")
-			.arg(fmt(_manager->last_capture_ms()))
-			.arg(fmt(_manager->last_report_ms()))
-			.arg(fmt(_manager->last_total_ms())));
-	} else {
-		_timing_label->setText(QString::fromUtf8("本次耗时: —"));
-	}
-
-	// Path of the CSV being written. A run can be several minutes long, so the
-	// file is created up front: printing the path here makes it reachable
-	// without waiting for the measurement to stop.
-	const QString csv = _manager->csv_path();
-	QString csv_line;
-	if (csv.isEmpty()) {
-		csv_line = QString::fromUtf8("正在保存的 CSV: —");
-	} else {
-		// Elide the middle, not the tail: the file name stays readable.
-		const int room = std::max(220, _host->width() - 40);
-		const QString elided = _csv_label->fontMetrics().elidedText(
-				csv, Qt::ElideMiddle, room);
-		csv_line = QString::fromUtf8("正在保存的 CSV: %1").arg(elided);
-		_csv_label->setToolTip(csv);
-	}
-	if (csv_line != _csv_shown) {
-		_csv_shown = csv_line;
-		_csv_label->setText(csv_line);
-	}
 
 	_table->setRowCount(static_cast<int>(cfg.channels.size()));
 
@@ -273,6 +360,57 @@ void PpsResultDock::refresh()
 		table_h += _table->rowHeight(r);
 	table_h += 2 * _table->frameWidth();
 	_table->setFixedHeight(table_h);
+}
+
+void PpsResultDock::on_open_file()
+{
+	const QString csv = _manager->csv_path();
+
+#ifdef Q_OS_WIN
+	// The CSV only appears on disk once the first frame is written, but the
+	// button is enabled as soon as the run has a path. "explorer.exe
+	// /select,<missing file>" does not fail loudly: Explorer drops the /select
+	// argument and opens its default location (文档), which is what made the
+	// button look like it ignored the autosave folder. So resolve the deepest
+	// directory that really exists and open that instead.
+	QString file;
+	QString target;
+	if (!csv.isEmpty()) {
+		file = QFileInfo(csv).absoluteFilePath();
+		target = QFileInfo(file).absolutePath();
+		while (!target.isEmpty() && !QFileInfo(target).isDir()) {
+			const QString up = QFileInfo(target).absolutePath();
+			if (up == target)
+				break;
+			target = up;
+		}
+	}
+	if (target.isEmpty() || !QFileInfo(target).isDir()) {
+		// No run yet: fall back to the configured save directory, then to the
+		// application's own folder, so the button always opens something real.
+		target = _manager->config().save_dir;
+		if (target.isEmpty() || !QFileInfo(target).isDir())
+			target = QCoreApplication::applicationDirPath();
+	}
+
+	if (!file.isEmpty() && QFileInfo(file).isFile()) {
+		dsv_info("1PPS open file: %s",
+			QDir::toNativeSeparators(file).toUtf8().constData());
+		QProcess::startDetached("explorer.exe",
+			QStringList() << (QString("/select,") +
+				QDir::toNativeSeparators(file)));
+	} else {
+		// File not written yet: show the folder it will appear in.
+		dsv_info("1PPS open file: %s (not created yet), opening its folder",
+			QDir::toNativeSeparators(file).toUtf8().constData());
+		QProcess::startDetached("explorer.exe",
+			QStringList() << QDir::toNativeSeparators(target));
+	}
+#else
+	const QString dir = csv.isEmpty()
+		? _manager->config().save_dir : QFileInfo(csv).absolutePath();
+	QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
+#endif
 }
 
 } // namespace dock

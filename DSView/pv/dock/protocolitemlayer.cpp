@@ -37,10 +37,12 @@ ProtocolItemLayer::ProtocolItemLayer(QWidget *parent, QString protocolName, IPro
         m_bSetting = false;
         m_decoderStatus = NULL;
         _trace = NULL;
+        _run_visible = false;
 
         _protocol_label = new QLabel(parent);
         _progress_label = new QLabel(parent);
         _set_button = new QPushButton(parent);
+        _run_button = new QPushButton(parent);
         _del_button = new QPushButton(parent);
         _format_combox = new DsComboBox(parent);
 
@@ -49,6 +51,12 @@ ProtocolItemLayer::ProtocolItemLayer(QWidget *parent, QString protocolName, IPro
         _del_button->setIcon(QIcon(iconPath + "/del.svg"));
         _set_button->setFlat(true);
         _set_button->setIcon(QIcon(iconPath + "/gear.svg"));
+        _run_button->setFlat(true);
+        _run_button->setIcon(QIcon(iconPath + "/run.svg"));
+        _run_button->setToolTip(tr("重新解码这个解码器（只在使用解码调试控制台时显示）"));
+        // Follows the console: the button exists but stays out of the layout
+        // until the debug console is open.
+        _run_button->setVisible(false);
         _protocol_label->setText(protocolName);
 
         m_singleFlag = true;     
@@ -57,6 +65,7 @@ ProtocolItemLayer::ProtocolItemLayer(QWidget *parent, QString protocolName, IPro
  
         QHBoxLayout *hori_layout = this;
         hori_layout->addWidget(_set_button);
+        hori_layout->addWidget(_run_button);
         hori_layout->addWidget(_del_button);
         hori_layout->addWidget(_format_combox);
         hori_layout->addWidget(_protocol_label);
@@ -68,6 +77,7 @@ ProtocolItemLayer::ProtocolItemLayer(QWidget *parent, QString protocolName, IPro
 
         connect(_del_button, SIGNAL(clicked()),this, SLOT(on_del_protocol()));        
         connect(_set_button, SIGNAL(clicked()),this, SLOT(on_set_protocol()));
+        connect(_run_button, SIGNAL(clicked()),this, SLOT(on_run_protocol()));
         connect(_format_combox, SIGNAL(currentIndexChanged(int)),this, SLOT(on_format_select_changed(int)));
 
         update_font();
@@ -77,6 +87,7 @@ ProtocolItemLayer::~ProtocolItemLayer(){
      DESTROY_QT_OBJECT(_progress_label);
      DESTROY_QT_OBJECT(_protocol_label);
      DESTROY_QT_OBJECT(_set_button);
+     DESTROY_QT_OBJECT(_run_button);
      DESTROY_QT_OBJECT(_del_button);
      DESTROY_QT_OBJECT(_format_combox);
 }
@@ -90,6 +101,16 @@ void ProtocolItemLayer::on_set_protocol()
 
 void ProtocolItemLayer::on_del_protocol(){
     m_callback->OnProtocolDelete(this);
+}
+
+void ProtocolItemLayer::on_run_protocol(){
+    m_callback->OnProtocolRun(this);
+}
+
+void ProtocolItemLayer::set_run_visible(bool visible)
+{
+    _run_visible = visible;
+    _run_button->setVisible(visible);
 }
 
 void ProtocolItemLayer::on_format_select_changed(int index){
@@ -118,6 +139,7 @@ void ProtocolItemLayer::ResetStyle(){
     QString iconPath = GetIconPath();
      _del_button->setIcon(QIcon(iconPath + "/del.svg"));
     _set_button->setIcon(QIcon(iconPath + "/gear.svg"));
+    _run_button->setIcon(QIcon(iconPath + "/run.svg"));
 }
 
 void ProtocolItemLayer::LoadFormatSelect(bool bSingle)

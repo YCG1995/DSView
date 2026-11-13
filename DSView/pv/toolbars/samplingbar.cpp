@@ -98,10 +98,19 @@ namespace pv
             leftMargin->setFixedWidth(4);
             addWidget(leftMargin);
 
+#if defined(Q_OS_ANDROID)
+            /* 手机屏窄：采样栏的次要按钮只显示图标（有 tooltip），把宽度留给下拉框 */
+            _device_type.setToolButtonStyle(Qt::ToolButtonIconOnly);
+#else
             _device_type.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+#endif
             addWidget(&_device_type);
             addWidget(&_device_selector);
+#if defined(Q_OS_ANDROID)
+            _configure_button.setToolButtonStyle(Qt::ToolButtonIconOnly);
+#else
             _configure_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+#endif
             addWidget(&_configure_button);
 
             addWidget(&_sample_count);
@@ -119,12 +128,20 @@ namespace pv
             _mode_menu->addAction(_action_loop);
             _mode_button.setMenu(_mode_menu);
 
+#if defined(Q_OS_ANDROID)
+            _mode_button.setToolButtonStyle(Qt::ToolButtonIconOnly);
+#else
             _mode_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+#endif
             _mode_action = addWidget(&_mode_button);
 
             _run_stop_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
             _run_stop_action = addWidget(&_run_stop_button);
+#if defined(Q_OS_ANDROID)
+            _instant_button.setToolButtonStyle(Qt::ToolButtonIconOnly);
+#else
             _instant_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+#endif
             _instant_action = addWidget(&_instant_button); 
 
             update_view_status();

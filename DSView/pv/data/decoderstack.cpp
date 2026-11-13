@@ -153,6 +153,11 @@ void DecoderStack::build_row()
     }
     _rows.clear();
 
+    // Drop the class -> row map as well: its keys hold the decoder definition
+    // the rows were built from (see Row), and a reloaded script replaces that
+    // definition, so entries from the previous version must not survive.
+    _class_rows.clear();
+
     // Add classes
     for (auto dec : _stack)
     { 
@@ -415,6 +420,117 @@ bool DecoderStack::check_required_probes()
     return true;
 }
 
+// Log the binding state behind a failed decode. The row message is the same no
+// matter whether a probe entry is missing or the capture carried no logic data,
+// which is what made "channel not enabled" so hard to read.
+void DecoderStack::log_probe_diagnosis(const char *reason)
+{
+    int logic_total = 0, logic_enabled = 0;
+    if (_session) {
+        for (auto s : _session->get_signals()) {
+            if (s->signal_type() != SR_CHANNEL_LOGIC)
+                continue;
+            ++logic_total;
+            if (s->enabled())
+                ++logic_enabled;
+        }
+    }
+
+    dsv_err("decode aborted (%s): logic signals=%d enabled=%d traces=%d",
+            reason, logic_total, logic_enabled, (int)_stack.size());
+
+    for (auto dec : _stack) {
+        const srd_decoder *def = dec->get_dec_handel();
+        if (!def) {
+            dsv_err("  decoder without definition");
+            continue;
+        }
+        dsv_err("  %s required=%d optional=%d bound=%d",
+                dec->id(), (int)g_slist_length((GSList *)def->channels),
+                (int)g_slist_length((GSList *)def->opt_channels),
+                (int)dec->binded_probe_list().size());
+    }
+}
+
+// Bind the required channels that have no probe entry at all. Only the root
+// decoder receives samples, so only its map is completed. This mirrors what
+// SigSession::add_decoder() does for a freshly added decoder: a stack that came
+// back from the saved session, or one whose required channel list differs from
+// the binding that was stored, otherwise dead-locks on
+// "One or more required channels have not been specified" and never decodes
+// again - the symptom users describe as "the demo device cannot auto decode".
+bool DecoderStack::ensure_required_probes()
+{
+    if (_session == nullptr || _stack.empty())
+        return false;
+
+    decode::Decoder *root = _stack.front();
+    const srd_decoder *def = root ? root->get_dec_handel() : nullptr;
+    if (def == nullptr)
+        return false;
+
+    // Channels this device really carries, in the order the session lists them.
+    std::vector<int> avail;
+    for (auto s : _session->get_signals()) {
+        if (s->signal_type() != SR_CHANNEL_LOGIC || !s->enabled())
+            continue;
+        const int idx = s->get_index();
+        if (std::find(avail.begin(), avail.end(), idx) == avail.end())
+            avail.push_back(idx);
+    }
+    if (avail.empty())
+        return false;
+
+    std::map<const srd_channel *, int> probes;
+    std::vector<int> used;
+    for (auto pdch : root->binded_probe_list()) {
+        const int idx = root->binded_probe_index(pdch);
+        if (idx < 0)
+            continue;
+        probes[pdch] = idx;
+        used.push_back(idx);
+    }
+
+    bool added = false;
+    QStringList new_bindings;
+    for (GSList *l = def->channels; l; l = l->next) {
+        const srd_channel *pdch = static_cast<const srd_channel *>(l->data);
+        if (probes.find(pdch) != probes.end())
+            continue;
+
+        int candidate = -1;
+        for (int idx : avail) {
+            if (std::find(used.begin(), used.end(), idx) == used.end()) {
+                candidate = idx;
+                break;
+            }
+        }
+        // Every channel is already taken by another probe of this decoder:
+        // sharing one is what srd accepts, so keep the decode running.
+        if (candidate < 0)
+            candidate = avail[(int)used.size() % (int)avail.size()];
+
+        probes[pdch] = candidate;
+        used.push_back(candidate);
+        added = true;
+        new_bindings.push_back(QString("%1->%2").arg(QString::fromUtf8(pdch->id))
+                                   .arg(candidate));
+    }
+
+    if (!added)
+        return false;
+
+    root->set_probes(probes);
+    root->commit();
+
+    dsv_info("Decode: decoder %s was missing a channel binding, bound %s",
+            root->id(), qPrintable(new_bindings.join(", ")));
+    srd_console_write(qPrintable(
+            QString("[decode] 解码器 %1 缺少通道绑定，已自动绑定 %2\n")
+                    .arg(QString::fromUtf8(root->id()), new_bindings.join(", "))));
+    return true;
+}
+
 void DecoderStack::do_decode_work()
 {
     //set the flag to exit from task thread 
@@ -428,6 +544,17 @@ void DecoderStack::do_decode_work()
 
     if (!_options_changed)
     {  
+        // Nothing to do: this task only repeats the run that produced the
+        // current result. Drop the error text of that run too - after a new
+        // capture the message ("no channel enabled", "no data") describes
+        // data that is already gone, and the view keeps painting it because
+        // DecodeTrace::paint_mid() reads error_message() unconditionally.
+        if (!_error_message.isEmpty()) {
+            dsv_info("Clear stale decode error: %s",
+                    _error_message.toUtf8().constData());
+            _error_message.clear();
+            _decoder_status->clear();
+        }
         dsv_err("ERROR:Decoder options have not changed.");
         return;
     } 
@@ -437,8 +564,18 @@ void DecoderStack::do_decode_work()
 
     _snapshot = NULL;
 
+    // A decoder restored with the session (or one whose channel list changed
+    // with the device) may be missing the probe entry of a required channel.
+    // srd would abort the whole decode with "channel not enabled", so bind the
+    // missing ones to channels of the current device first instead of failing.
+    ensure_required_probes();
+
 	// Check that all decoders have the required channels
     if (!check_required_probes()) {
+        // The row only says "a required channel is not enabled" - log which
+        // decoder lost which channel, and how many logic channels the session
+        // actually offers, so the cause is visible in the log instead of guessed.
+        log_probe_diagnosis("required probes missing");
         _error_message = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_DECODERSTACK_DECODE_WORK_ERROR),
                             "One or more required channels have not been specified");
         dsv_err("ERROR:%s", _error_message.toStdString().c_str());
@@ -458,6 +595,19 @@ void DecoderStack::do_decode_work()
                         break;
                 }
             }
+            // The binding may point at a channel this capture no longer carries
+            // (narrower channel range or a rate that offers fewer channels). All
+            // logic signals of a capture share one snapshot, so take it from any
+            // of them and let rebind_stale_probes() repair the binding below.
+            if (_snapshot == NULL) {
+                for(auto s :  _session->get_signals()) {
+                    if (s->signal_type() != SR_CHANNEL_LOGIC)
+                        continue;
+                    _snapshot = ((pv::view::LogicSignal*)s)->data();
+                    if (_snapshot != NULL)
+                        break;
+                }
+            }
             if (_snapshot != NULL)
                 break;
         }
@@ -465,6 +615,7 @@ void DecoderStack::do_decode_work()
 
 	if (_snapshot == NULL)
     {   
+        log_probe_diagnosis("no logic snapshot");
         _error_message = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_DECODERSTACK_DECODE_WORK_ERROR),
                              "One or more required channels have not been specified");
         dsv_err("ERROR:%s", _error_message.toStdString().c_str());
@@ -473,9 +624,21 @@ void DecoderStack::do_decode_work()
 
     if (_session->is_realtime_refresh() == false && _snapshot->empty())
     { 
-        dsv_err("ERROR:Decode data is empty.");
+        // Nothing has been captured yet, or the buffer is still filling up.
+        // This is not a decoder failure, so do not paint an error onto the row:
+        // a red "No data to decode" line right after adding the decoder (or
+        // right after pressing start) was the stale-looking message users
+        // reported. The decode is simply deferred to the end of the capture.
+        _error_message.clear();
         return;
     }
+
+    // The decoder may have been bound to a channel the previous capture carried
+    // and this one does not (narrower channel range, a rate that offers fewer
+    // channels, a channel switched off). Decoding would then abort with "At
+    // least one of selected channels are not enabled"; rebind those probes
+    // first so the automatic decode after a trigger keeps working.
+    rebind_stale_probes();
 
     // Get the samplerate
 	_samplerate = _snapshot->samplerate();
@@ -525,6 +688,7 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
     char *error = NULL; 
     bool bError = false;
     bool bEndTime = false;
+    int wait_loops = 0;
 
     if( i >= decode_end){
         dsv_info("decode data index have been to end");
@@ -552,15 +716,25 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
 
         if (_is_capture_end)
         {
-            if (!bCheckEnd){
-                bCheckEnd = true;
+            // Samples that are really there, not the ring write position (see
+            // execute_decode_stack()).
+            uint64_t align_sample_count = _snapshot->get_sample_count();
 
-                uint64_t align_sample_count = _snapshot->get_ring_sample_count();
-
-                if (align_sample_count == 0){
-                    dsv_info("Have no data to decode.");
+            if (align_sample_count == 0){
+                // A capture in progress has not delivered its first frame yet.
+                // Wait for it instead of silently dropping the decode: the task
+                // runs once per capture/file and nothing would re-trigger it.
+                if (status->_bStop || ++wait_loops > 50) {
+                    dsv_info("Have no data to decode (waited %d ms).",
+                            wait_loops * 200);
                     return;
                 }
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+
+            if (!bCheckEnd){
+                bCheckEnd = true;
 
                 if (end_index >= align_sample_count){
                     end_index = align_sample_count - 1;
@@ -574,7 +748,7 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
                 }
             }
         }
-        else if (i >= _snapshot->get_ring_sample_count())
+        else if (i >= _snapshot->get_sample_count())
         {   
             // Wait the data is ready.
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -610,6 +784,25 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
                 else {
                     _error_message = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_DECODERSTACK_DECODE_DATA_ERROR),
                                      "At least one of selected channels are not enabled.");
+                    // Tell the console exactly which channel the decoder wanted
+                    // and which ones this capture actually carries: without it
+                    // the only visible symptom is the row error.
+                    QString msg = QString("[decode] 解码器 %1 需要通道 %2，"
+                                          "但本次采集没有这个通道的数据；可用通道：")
+                            .arg(QString::fromUtf8(logic_di->decoder->id))
+                            .arg(sig_index);
+                    bool any = false;
+                    for (auto s : _session->get_signals()) {
+                        if (s->signal_type() != SR_CHANNEL_LOGIC)
+                            continue;
+                        const int idx = s->get_index();
+                        if (!_snapshot->has_data(idx))
+                            continue;
+                        msg += (any ? ", " : "") + QString::number(idx);
+                        any = true;
+                    }
+                    srd_console_write(qPrintable(msg + (any ? "\n" : "（无）\n")));
+                    dsv_err("%s", qPrintable(msg));
                     return;
                 }
             }
@@ -640,6 +833,8 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
             if (error){
                 _error_message = QString::fromLocal8Bit(error);
                 dsv_err("ERROR: Failed to call srd_session_send:%s", error);
+                srd_console_write(error);
+                srd_console_write("\n");
                 g_free(error);
                 error = NULL;
             }
@@ -649,7 +844,7 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
         }
 
         decoded_sample_count += chunk_end - i; 
-        _progress = (int)(decoded_sample_count * 100 / end_index);
+        _progress = end_index ? (int)(decoded_sample_count * 100 / end_index) : 100;
         i = chunk_end;   
  
         //use mutex
@@ -690,6 +885,90 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
     dsv_info("Decoded sample count:%llu", decoded_sample_count);
 }
 
+void DecoderStack::rebind_stale_probes()
+{
+    // Only the root decoder receives the sample data; a stacked sub decoder's
+    // channels are fed from its parent, so leaving its bindings alone is both
+    // harmless and required (a "repair" there would break the stack).
+    if (_snapshot == nullptr || _session == nullptr || _stack.empty())
+        return;
+
+    decode::Decoder *root = _stack.front();
+    if (root == nullptr || !root->have_probes())
+        return;
+
+    // Channels that really carry data in this capture.
+    std::vector<int> avail;
+    for (auto s : _session->get_signals()) {
+        if (s->signal_type() != SR_CHANNEL_LOGIC)
+            continue;
+        const int idx = s->get_index();
+        if (_snapshot->has_data(idx) &&
+                std::find(avail.begin(), avail.end(), idx) == avail.end())
+            avail.push_back(idx);
+    }
+    if (avail.empty()) {
+        dsv_info("Decode: no channel of this capture carries data, probes left "
+            "untouched");
+        return;
+    }
+
+    std::map<const srd_channel *, int> probes;
+    bool changed = false;
+
+    for (auto pdch : root->binded_probe_list()) {
+        const int idx = root->binded_probe_index(pdch);
+        if (idx >= 0 && _snapshot->has_data(idx))
+            probes[pdch] = idx;
+        else
+            changed = true;
+    }
+    dsv_info("Decode: %s probes=%d available=%d changed=%d",
+        root->id(), (int)root->binded_probe_list().size(), (int)avail.size(),
+        changed ? 1 : 0);
+
+    // A required channel whose binding went stale gets a channel that exists,
+    // so the decode runs instead of aborting with "channel not enabled".
+    // Optional channels (def->opt_channels) also get a dec_channelmap entry in
+    // srd_decoder_inst_new(), so a stale binding there aborts the decode just
+    // the same - repair them too.
+    const srd_decoder *def = root->get_dec_handel();
+    int next = 0;
+    auto repair = [&](GSList *chans) {
+        for (GSList *l = chans; l; l = l->next) {
+            const srd_channel *pdch = static_cast<const srd_channel *>(l->data);
+            if (probes.find(pdch) != probes.end())
+                continue;
+            probes[pdch] = avail[next % (int)avail.size()];
+            ++next;
+            changed = true;
+        }
+    };
+    if (def) {
+        repair(def->channels);
+        repair(def->opt_channels);
+    }
+
+    if (!changed)
+        return;
+
+    root->set_probes(probes);
+    root->commit();
+    dsv_info("Decode: decoder %s had a stale channel binding, rebound to the "
+        "channels present in this capture", root->id());
+
+    // Make the repair visible in the debug console: without it the decode
+    // silently reads a different channel than the one the user configured.
+    // Report the bindings that are actually in effect now, not the set of
+    // channels this capture happens to carry.
+    QStringList bound;
+    for (auto pdch : root->binded_probe_list())
+        bound.push_back(QString::number(root->binded_probe_index(pdch)));
+    QString msg = QString("[decode] 解码器 %1 绑定的通道不在本次采集中，已自动改绑到通道 %2")
+            .arg(QString::fromUtf8(root->id()), bound.join(", "));
+    srd_console_write(qPrintable(msg + "\n"));
+}
+
 void DecoderStack::execute_decode_stack()
 {  
 	srd_session *session = NULL;
@@ -709,8 +988,12 @@ void DecoderStack::execute_decode_stack()
         assert(false);
     }
     
-    // Get the intial sample count
-    _sample_count = _snapshot->get_ring_sample_count();
+    // Get the intial sample count. This must be the number of samples that are
+    // actually in the buffer: get_ring_sample_count() is the ring write
+    // position and stays 0 until the buffer wraps around, so a capture that
+    // fits in the buffer (every demo capture, and any file that was opened)
+    // used to look like "no data" and the decode was skipped silently.
+    _sample_count = _snapshot->get_sample_count();
  
     // Create the decoders
     for(auto dec : _stack)
@@ -731,14 +1014,53 @@ void DecoderStack::execute_decode_stack()
 		prev_di = di;
         decode_start = dec->decode_start();
 
-        if (_session->is_realtime_refresh() == false)
-            decode_end = min(dec->decode_end(), _sample_count-1);
-        else
+        if (_session->is_realtime_refresh() == false) {
+            // Only clamp when the buffer already holds samples; with an empty
+            // buffer _sample_count - 1 wraps around to UINT64_MAX.
+            decode_end = (_sample_count > 0)
+                    ? min(dec->decode_end(), _sample_count - 1)
+                    : dec->decode_end();
+        }
+        else {
             decode_end = max(dec->decode_end(), decode_end);
+        }
 	}
 
-    dsv_info("Decode start sample index:%llu, end sample index:%llu, count:%llu", 
-            (u64_t)decode_start, (u64_t)decode_end, (u64_t)(decode_end - decode_start + 1));
+    // Debug mode: only decode the leading part of the data.
+    if (_debug_sample_limit > 0 && decode_end > decode_start + _debug_sample_limit - 1) {
+        decode_end = decode_start + _debug_sample_limit - 1;
+        dsv_info("Decoder debug limit active, decoding %llu samples.",
+                (u64_t)_debug_sample_limit);
+    }
+
+    dsv_info("Decode start sample index:%llu, end sample index:%llu, count:%llu"
+             " (samples=%llu total=%llu dec_end=%llu)",
+            (u64_t)decode_start, (u64_t)decode_end, (u64_t)(decode_end - decode_start + 1),
+            (u64_t)_sample_count,
+            (u64_t)_snapshot->get_total_sample_count(),
+            (u64_t)_stack.empty() ? 0 : (u64_t)_stack.front()->decode_end());
+
+    // Nothing captured yet: decode_data() waits for the first samples (the demo
+    // device delivers them a moment after the task starts) and only gives up
+    // after a timeout, so an empty buffer is not an error state.
+    if (_sample_count == 0) {
+        dsv_info("Decode waiting for the first samples (decode %llu..%llu)",
+                (u64_t)decode_start, (u64_t)decode_end);
+    }
+
+    if (decode_end < decode_start) {
+        // A real decode range problem (cursor limit or region collapse) - say
+        // so instead of blaming a channel.
+        _error_message = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_NO_DATA),
+                "No data to decode");
+        srd_console_write(qPrintable(
+                QString("[decode] 解码区间为空（%1..%2），请重新框选\n")
+                        .arg(decode_start).arg(decode_end)));
+        dsv_err("Decode range is empty (%llu..%llu)",
+                (u64_t)decode_start, (u64_t)decode_end);
+        srd_session_destroy(session);
+        return;
+    }
 
 	// Start the session
 	srd_session_metadata_set(session, SRD_CONF_SAMPLERATE,

@@ -29,10 +29,18 @@ struct PpsConfig
     int trigger_pos_percent;    // 0..100, default 50
     double capture_time_ms;     // time window, default 10
     uint64_t sample_rate;       // selected buffer-mode rate
-    QString save_dir;           // directory for CSV files
-    // Master switch for "save the raw frame when a measured channel has no
-    // edge". Each channel can opt in separately (PpsChannel::save_on_loss).
-    bool auto_save_loss;
+    QString save_dir;           // directory for CSV files (and DSL folders)
+    // DSL auto-save, three independent triggers (the dialog shows them as the
+    // "DSL 保存" column):
+    //   dsl_save_loss     - a measured channel (opted in via
+    //                       PpsChannel::save_on_loss) has no edge in this frame
+    //   dsl_save_abnormal - a measured channel has more than one edge in the
+    //                       window, i.e. an unexpected extra pulse
+    //   dsl_save_always   - every trigger saves its raw frame
+    // They may be combined; dsl_save_always supersedes the other two.
+    bool dsl_save_loss;
+    bool dsl_save_abnormal;
+    bool dsl_save_always;
     std::vector<PpsChannel> channels; // measured channels (ref excluded)
     // Channels the user explicitly switched off in the dialog. They are kept
     // here so reopening the dialog shows the same tick state again.
@@ -149,8 +157,26 @@ public:
     double last_capture_ms() const { return _last_capture_ms; }
     double last_report_ms() const { return _last_report_ms; }
     double last_total_ms() const { return _last_total_ms; }
+    // Wall time since "开始测量", frozen when the run stops.
+    qint64 run_elapsed_ms() const;
     // Path of the CSV file the current run writes to.
     const QString &csv_path() const { return _csv_path; }
+    // "自动保存波形" lives in the result dock now, so it can be flipped while a
+    // measurement is running; the dialog no longer shows this switch.
+    bool dsl_save_always() const { return _config.dsl_save_always; }
+    void set_dsl_save_always(bool on);
+
+    // One entry per measured frame since the run started. It is collected
+    // whether or not the wave window is open, so opening the window in the
+    // middle of a run still shows the whole run instead of starting empty.
+    struct PpsWaveFrame
+    {
+        qint64 t_ms;                    // ms since the run started
+        std::vector<double> values;     // per measured channel, ns
+        std::vector<char> valid;
+    };
+    const std::vector<PpsWaveFrame> &wave_history() const { return _wave_history; }
+    const std::vector<int> &wave_channels() const { return _wave_channels; }
 
 signals:
     void frame_updated();
@@ -166,9 +192,16 @@ private:
     // the capture is aborted with a message instead of waiting forever.
     void arm_watchdog();
     void on_watchdog_timeout();
-    // Save the current frame as a .dsl file because a selected channel lost its
-    // edge; returns true when a file was written.
+    // Save the current frame as a .dsl file; `tag` becomes the file name prefix
+    // (LOSS / MULTI / FRAME) and `reasons` is the human readable cause. Returns
+    // true when a file was written.
     bool save_loss_frame(const std::vector<PpsResult> &results);
+    bool save_frame_file(const QString &tag, const QStringList &reasons);
+    // Append the frame that was just measured to the wave history.
+    void record_wave_frame();
+    // Folder that receives the DSL files: a sub folder of the CSV directory,
+    // named exactly like the CSV file without its extension.
+    QString dsl_dir() const;
 
     SigSession *_session;
     QTimer *_watchdog = nullptr;
@@ -179,14 +212,21 @@ private:
     QString _start_error;
     int _frame_count;
     int _active_ch_num;
+    // Probes the hardware actually streams during a run: only the reference
+    // channel plus the measured ones. The driver sends just the enabled probes
+    // (ch_en bitmap), so 3 probes upload 3/16 of what a 16 channel run sends.
+    int _active_en_ch_num = 0;
     uint64_t _active_rate;
     QString _csv_path;
     std::vector<PpsResult> _last;
+    // Guard against a second DSV_MSG_END_COLLECT_WORK being delivered while
+    // process_frame() is still inside its nested event loop (DSL save).
+    bool _in_frame = false;
 
-    // Auto-save of anomalous frames (a selected channel had no edge).
+    // Auto-save of anomalous frames.
     ISessionDataGetter *_data_getter = nullptr;
     int _loss_frames = 0;
-    int _loss_seq = 0;
+    int _dsl_seq = 0;
     QString _last_dsl_path;
     // One DSL per minute at most: a channel that keeps losing its edge would
     // otherwise write a 45 KB file four times a second for a week.
@@ -199,6 +239,27 @@ private:
     double _last_capture_ms;
     double _last_report_ms;
     double _last_total_ms;
+    // Run clock: starts at 开始测量 and is frozen at 停止, so the dock can show
+    // "测试时长" that keeps its value after the run ends.
+    QElapsedTimer _run_timer;
+    qint64 _run_elapsed_ms = 0;
+
+    std::vector<PpsWaveFrame> _wave_history;
+    std::vector<int> _wave_channels;
+
+    // Probe enable flags as they were before the run started. A run needs the
+    // hardware to stream only a subset, so the flags are put back on stop - a
+    // measurement must not leave the user's channel setup changed.
+    std::vector<std::pair<int, bool> > _probe_backup;
+    bool _probe_backup_valid = false;
+    // Device settings the run overrides, put back with the probes. A run may
+    // switch the channel mode (16ch/8ch) and the samplerate; leaving those changed
+    // would resize the main window's channel table and hide channels the user
+    // still has switched on.
+    int _op_mode_backup = 0;
+    int _ch_mode_backup = -1;
+    bool _mode_switched = false;
+    void restore_probe_state();
 
     // Welford accumulators per measured channel (index aligned to
     // _config.channels). Running mean/m2 instead of sum/sum2 keeps the

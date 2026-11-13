@@ -2,6 +2,7 @@
  * Calibration run implementation.
  */
 #include "ppscalibration.h"
+#include "ppstesthooks.h"
 #include "ppsmanager.h"
 #include "../sigsession.h"
 #include "../deviceagent.h"
@@ -196,7 +197,7 @@ bool PpsCalibration::apply_hardware_config()
 	uint64_t rate = _cfg.sample_rate;
 	// Verification hook: force a rate, so the stream fallback can be exercised
 	// on a device whose buffer is large enough at the default rate.
-	const QByteArray rate_env = qgetenv("DSVIEW_PPS_CALIB_RATE");
+	const QByteArray rate_env = test_env("DSVIEW_PPS_CALIB_RATE");
 	if (!rate_env.isEmpty() && rate_env.toULongLong() > 0)
 		rate = rate_env.toULongLong();
 	if (!caps.rates.empty()) {
@@ -258,7 +259,7 @@ bool PpsCalibration::apply_hardware_config()
 	// buffer, so the stream-specific code can be exercised at the ordinary 100
 	// MHz rate (DSVIEW_PPS_CALIB_FORCE_STREAM=1).
 	const bool force_stream =
-		qgetenv("DSVIEW_PPS_CALIB_FORCE_STREAM") == "1";
+		test_env("DSVIEW_PPS_CALIB_FORCE_STREAM") == "1";
 	if (force_stream
 			|| (depth != 0 && sample_count > depth)) {
 		/*
@@ -369,7 +370,7 @@ bool PpsCalibration::apply_hardware_config()
 	// high. 1% of a 1200 ms window is ~12 ms of pre-trigger history.
 	if (_stream_mode)
 		trig_pos = 1;
-	const QString pos_env = QString::fromUtf8(qgetenv("DSVIEW_PPS_CALIB_POS"));
+	const QString pos_env = QString::fromUtf8(test_env("DSVIEW_PPS_CALIB_POS"));
 	if (!pos_env.isEmpty())
 		trig_pos = qBound(0, pos_env.toInt(), 100);
 	ds_trigger_reset();
@@ -576,7 +577,7 @@ void PpsCalibration::advance_after_capture(bool usable, size_t edges,
 	// which crashed the first implementation. Hand it to the event loop and
 	// return; DSVIEW_PPS_CALIB_WIDEN=0 keeps the window fixed for diagnosis.
 	if (!usable && !_stop_requested && _stream_mode && !_widened && _retry == 0
-			&& qgetenv("DSVIEW_PPS_CALIB_WIDEN") != "0") {
+			&& test_env("DSVIEW_PPS_CALIB_WIDEN") != "0") {
 		_widened = true;
 		dsv_info("1PPS calib: single edge in a %.0f ms stream frame, "
 			"widening the window once", _cfg.window_ms);
@@ -656,9 +657,26 @@ void PpsCalibration::advance_after_capture(bool usable, size_t edges,
 	PpsCalibResult res;
 	res.measured_ms = _sum_samples / static_cast<double>(_usable)
 			/ static_cast<double>(_active_rate) * 1000.0;
+	// Telling 1PPS from the 10ms test signal by ">= threshold" alone accepted
+	// anything slower than the threshold as 1PPS (100ms, 2s, ...) and anything
+	// faster as 10ms (1ms, 5ms, ...), and then divided the wrong standard
+	// period by it: the factor came out plausible but wrong. Accept only
+	// measured periods that really sit on one of the two standards.
+	const double measured = res.measured_ms;
+	const bool is_10ms = measured >= 9.0 && measured <= 11.0;
+	const bool is_1pps = measured >= 900.0 && measured <= 1100.0;
+	if (!is_10ms && !is_1pps) {
+		_error = QString::fromUtf8(
+			"校准失败：测出的周期约为 %1 ms，既不是 10 ms 也不是 1 s，"
+			"无法识别输入信号。请确认接入的是 1PPS 或 10ms 测试信号。")
+			.arg(measured, 0, 'f', 3);
+		emit failed(_error);
+		return;
+	}
+
 	res.captures = _usable;
 	res.edges = _last_edges;
-	if (res.measured_ms >= kOnePpsThresholdMs) {
+	if (is_1pps) {
 		res.standard_ms = 1000.0;   // 1PPS
 		res.input_name = QString::fromUtf8("1PPS");
 	} else {

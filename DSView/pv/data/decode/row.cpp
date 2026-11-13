@@ -40,13 +40,16 @@ Row::Row(const srd_decoder *decoder, const srd_decoder_annotation_row *row, cons
     _row(row),
     _order(order)
 {
-} 
+    cache_text();
+}
 
 Row::Row(const Row &o)
 {
 	_decoder = o._decoder;
 	_row = o._row;
 	_order = o._order;
+    _title = o._title;
+    _title_id = o._title_id;
 }
 
 Row& Row::operator=(const Row &o)
@@ -54,39 +57,57 @@ Row& Row::operator=(const Row &o)
 	_decoder = o._decoder;
 	_row = o._row;
 	_order = o._order;
+    _title = o._title;
+    _title_id = o._title_id;
 	return (*this);
+}
+
+/*
+ * Copy the display text while the decoder definition is still alive.
+ *
+ * The name/id/desc strings belong to the decoder definition, and
+ * srd_decoder_reload() frees that definition as soon as the new script has
+ * been imported. Row objects outlive it in DecoderStack's _rows, _rows_gshow,
+ * _rows_lshow and _class_rows maps, so reading the text out of _decoder / _row
+ * on demand means the next repaint (DecoderModel::headerData ->
+ * DecoderStack::list_row_title -> Row::title) runs strlen() on freed memory.
+ * Caching the text at construction time keeps those maps usable.
+ */
+void Row::cache_text()
+{
+    _title.clear();
+    _title_id.clear();
+
+    const QString dec_name = (_decoder && _decoder->name)
+            ? QString::fromUtf8(_decoder->name) : QString();
+    const QString dec_id = (_decoder && _decoder->id)
+            ? QString::fromUtf8(_decoder->id) : QString();
+    const QString row_desc = (_row && _row->desc)
+            ? QString::fromUtf8(_row->desc) : QString();
+
+    if (!dec_name.isEmpty() && !row_desc.isEmpty())
+        _title = QString("%1: %2").arg(dec_name).arg(row_desc);
+    else if (!dec_name.isEmpty())
+        _title = dec_name;
+    else if (!row_desc.isEmpty())
+        _title = row_desc;
+
+    if (!dec_id.isEmpty() && !row_desc.isEmpty())
+        _title_id = QString("%1: %2").arg(dec_id).arg(row_desc);
+    else if (!dec_id.isEmpty())
+        _title_id = dec_id;
+    else if (!row_desc.isEmpty())
+        _title_id = row_desc;
 }
 
 QString Row::title() const
 {
-	if (_decoder && _decoder->name && _row && _row->desc)
-		return QString("%1: %2")
-			.arg(QString::fromUtf8(_decoder->name))
-			.arg(QString::fromUtf8(_row->desc));
-
-	if (_decoder && _decoder->name)
-		return QString::fromUtf8(_decoder->name);
-
-	if (_row && _row->desc)
-		return QString::fromUtf8(_row->desc);
-
-	return QString();
+	return _title;
 }
 
 QString Row::title_id() const
 {
-	if (_decoder && _decoder->id && _row && _row->desc)
-		return QString("%1: %2")
-			.arg(QString::fromUtf8(_decoder->id))
-			.arg(QString::fromUtf8(_row->desc));
-
-	if (_decoder && _decoder->id)
-		return QString::fromUtf8(_decoder->id);
-
-	if (_row && _row->desc)
-		return QString::fromUtf8(_row->desc);
-
-	return QString();
+	return _title_id;
 }
 
 bool Row::operator<(const Row &other) const

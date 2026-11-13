@@ -147,6 +147,18 @@ namespace pv
 
     SigSession::~SigSession()
     {
+        // SigSession is not a QObject, so the script watcher and its debounce
+        // timer have no parent to delete them.
+        if (_script_reload_timer) {
+            _script_reload_timer->stop();
+            delete _script_reload_timer;
+            _script_reload_timer = nullptr;
+        }
+        if (_script_watcher) {
+            delete _script_watcher;
+            _script_watcher = nullptr;
+        }
+
         for(auto p : _data_list){
             p->clear();
             delete p;
@@ -723,7 +735,7 @@ namespace pv
             // occupied by a background auto-save. With three buffers the
             // next capture virtually always gets a free buffer.
             int buf_index = -1;
-            for(int tries=0; tries<200 && buf_index<0; tries++)
+            for(int tries=0; tries<40 && buf_index<0; tries++)
             {
                 for(int i=0; i<(int)_data_list.size(); i++){
                     if (i != view_index && !_data_list[i]->is_saving()){
@@ -740,14 +752,14 @@ namespace pv
             }
 
             if (buf_index < 0){
-                // Fallback (should not happen in practice): reuse the
-                // non-view buffer that is not currently being written.
-                for(int i=0; i<(int)_data_list.size(); i++){
-                    if (i != view_index){
-                        buf_index = i;
-                        break;
-                    }
-                }
+                // Every candidate is being written by a background save right
+                // now. Clearing one of those would corrupt the file that is
+                // being generated (and free memory the writer is reading), so
+                // drop this frame instead and let the caller retry.
+                dsv_err("start_capture: all %d candidate buffer(s) are being "
+                    "saved, refusing to clear one of them",
+                    (int)_data_list.size() - 1);
+                return false;
             }
 
             _capture_data = _data_list[buf_index];
@@ -769,7 +781,7 @@ namespace pv
         if (mode == LOGIC)
         {
             for (auto de : _decode_traces){
-                if (bAddDecoder){
+                if (bAddDecoder && !_generic_decode_blocked){
                     de->decoder()->set_capture_end_flag(false);                 
                     de->frame_ended();
                     add_decode_task(de);
@@ -1602,6 +1614,15 @@ namespace pv
 
         out_trace = NULL;
 
+        if (_generic_decode_blocked)
+        {
+            // 1PPS measurement runs with its own C decoder; a Python decoder added
+            // now would compete with it for the capture frames.
+            dsv_err("Add decoder refused: %s",
+                _generic_decode_block_reason.toLocal8Bit().constData());
+            return false;
+        }
+
         //dsv_info("Create new decoder,name:\"%s\",id:\"%s\"", dec->name, dec->id);
 
         try
@@ -1624,7 +1645,34 @@ namespace pv
                 all_probes.push_back((const srd_channel *)i->data);
             }
 
+            // Bind the required channels to the enabled logic channels, in
+            // order, so a newly added decoder can decode immediately. Leaving
+            // the map empty made every decode abort with "One or more required
+            // channels have not been specified" (shown as 至少有一个需要解码的
+            // 通道未使能), which also killed the automatic decode after a
+            // capture. The channel/probe bindings stay editable in the options
+            // dialog, and rebind_stale_probes() repairs them when a later
+            // capture no longer carries the bound channel.
+            std::vector<int> enabled_logic;
+            int logic_ordinal = 0;
+            for (auto s : _signals) {
+                if (s->signal_type() != SR_CHANNEL_LOGIC)
+                    continue;
+                if (s->enabled())
+                    enabled_logic.push_back(logic_ordinal);
+                ++logic_ordinal;
+            }
+            size_t probe_pos = 0;
+            for (auto pdch : all_probes) {
+                if (probe_pos >= enabled_logic.size())
+                    break;
+                if (probes.find(pdch) != probes.end())
+                    continue;
+                probes[pdch] = enabled_logic[probe_pos++];
+            }
+
             decoder_stack->stack().front()->set_probes(probes);
+            decoder_stack->stack().front()->commit();
 
             // Create the decode signal
             view::DecodeTrace *trace = new view::DecodeTrace(this, decoder_stack, _decode_traces.size());
@@ -1767,6 +1815,49 @@ namespace pv
     {
         int dex = get_trace_index_by_key_handel(handel);
         rst_decoder(dex);
+    }
+
+    void SigSession::rerun_decoder_by_key_handel(void *handel)
+    {
+        int dex = get_trace_index_by_key_handel(handel);
+        view::DecodeTrace *trace = get_decoder_trace(dex);
+
+        if (trace == NULL) {
+            dsv_err("rerun: no decoder for handle=%p", handel);
+            srd_console_write("[run] no decoder matched, nothing re-run\n");
+            return;
+        }
+
+        if (_generic_decode_blocked) {
+            QString msg = QString("[run] 1PPS 测量进行中，通用解码器暂不运行（%1）\n")
+                    .arg(_generic_decode_block_reason);
+            srd_console_write(qPrintable(msg));
+            dsv_info("%s", qPrintable(msg.trimmed()));
+            return;
+        }
+
+        if (is_working()) {
+            srd_console_write("[run] capture is running, re-run skipped\n");
+            return;
+        }
+
+        const QString name = trace->decoder()->stack().empty()
+                ? QString("decoder")
+                : QString::fromStdString(
+                        trace->decoder()->stack().front()->module_name());
+
+        // Nothing changes here, only the data is decoded again: mark the options
+        // dirty so the worker does not take the "options have not changed"
+        // shortcut, and clear the previous result.
+        remove_decode_task(trace);
+        trace->decoder()->clear();
+        trace->decoder()->set_options_changed(true);
+        add_decode_task(trace);
+        data_updated();
+
+        QString msg = QString("[run] 重新解码 %1（trace %2）\n").arg(name).arg(dex);
+        srd_console_write(qPrintable(msg));
+        dsv_info("%s", qPrintable(msg.trimmed()));
     }
 
     void SigSession::spectrum_rebuild()
@@ -1968,8 +2059,11 @@ namespace pv
         if (script_dir.isEmpty())
             return "Decoder directory not found.";
 
-        // Fingerprint each package with the mtime of its newest script file.
+        // Fingerprint each package with the mtime of its newest script file, and
+        // remember which file that was: the reload report has to name the script
+        // it actually picked up, not just the package.
         QMap<QString, QDateTime> current;
+        QMap<QString, QString> current_file;
         const QDir root(script_dir);
 
         for (const QFileInfo &pkg : root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot))
@@ -1981,8 +2075,10 @@ namespace pv
             while (it.hasNext()) {
                 it.next();
                 const QDateTime t = it.fileInfo().lastModified();
-                if (!latest.isValid() || t > latest)
+                if (!latest.isValid() || t > latest) {
                     latest = t;
+                    current_file[pkg.fileName()] = it.filePath();
+                }
             }
 
             current[pkg.fileName()] = latest;
@@ -2005,18 +2101,6 @@ namespace pv
         if (changed.isEmpty())
             return "No decoder scripts have changed.";
 
-        // Stop the decode thread and clear the pending queue.
-        {
-            std::lock_guard<std::mutex> lock(_decode_task_mutex);
-            for (auto trace : _decode_tasks)
-                trace->decoder()->stop_decode_work();
-            _decode_tasks.clear();
-        }
-        for (auto trace : _decode_traces)
-            trace->decoder()->stop_decode_work();
-        if (_decode_thread.joinable())
-            _decode_thread.join();
-
         // Capture each affected Decoder's id and probe bindings before the
         // C reload frees the old srd_decoder / srd_channel objects.
         std::map<data::decode::Decoder*, QString> dec_id;
@@ -2032,34 +2116,245 @@ namespace pv
             }
         }
 
-        // Re-import only the changed packages.
+        // Syntax pre-check: compile every changed script before importing it.
+        // A broken script must not tear down the running decode session, so this
+        // runs before the decode thread is stopped (a failed save then leaves
+        // the previous, working script in place instead of killing the decode).
+        for (const QString &id : changed) {
+            char *check_error = NULL;
+            const int chk = srd_decoder_check(id.toUtf8().constData(), &check_error);
+            if (chk != SRD_OK) {
+                QString msg = check_error
+                        ? QString::fromLocal8Bit(check_error)
+                        : QString("Syntax error in ") + id;
+                if (check_error)
+                    g_free(check_error);
+                srd_console_write(qPrintable(msg + "\n"));
+                dsv_err("%s", qPrintable(msg));
+                return msg;
+            }
+        }
+
+        // Stop the decode thread and clear the pending queue.
+        {
+            std::lock_guard<std::mutex> lock(_decode_task_mutex);
+            for (auto trace : _decode_tasks)
+                trace->decoder()->stop_decode_work();
+            _decode_tasks.clear();
+        }
+        for (auto trace : _decode_traces)
+            trace->decoder()->stop_decode_work();
+        if (_decode_thread.joinable())
+            _decode_thread.join();
+
+
+        // Re-import the changed packages one at a time, and attach every decoder
+        // of that package as soon as its re-import succeeded. Doing the attach
+        // only after the whole loop used to leave a dangling _decoder behind
+        // when a later package failed to import: the earlier package was already
+        // reloaded (old object freed) but never re-pointed at the new one, and
+        // the next decode called _decoder->id on freed memory.
+        QStringList reloaded;
         for (const QString &id : changed) {
             const QByteArray b = id.toUtf8();
             const int rc = srd_decoder_reload(b.constData());
-            if (rc != SRD_OK)
-                return "Failed to reload decoder: " + id;
-        }
+            if (rc != SRD_OK) {
+                dsv_err("reload: decoder '%s' failed with %d, %d package(s) "
+                        "already reloaded", b.constData(), rc, reloaded.size());
+                // The C side kept the previous definition alive on failure, so
+                // the decoders of this package are still valid and usable; the
+                // ones already reloaded above have been re-attached in place.
+                return QString::fromUtf8(
+                        "重载 %1 失败（错误码 %2），该解码器继续使用旧脚本；"
+                        "已重载：%3")
+                        .arg(id).arg(rc)
+                        .arg(reloaded.isEmpty() ? QString::fromUtf8("无")
+                                               : reloaded.join(", "));
+            }
 
-        // Attach the new handles and remap probe bindings.
-        for (auto &kv : saved) {
-            data::decode::Decoder *dec = kv.first;
-            const QByteArray b = dec_id[dec].toUtf8();
             const srd_decoder *nd = srd_decoder_get_by_module_name(b.constData());
-            if (!nd)
-                return "Reloaded decoder missing: " + dec_id[dec];
-            dec->attach_decoder(nd, kv.second);
+            if (!nd) {
+                return QString::fromUtf8(
+                        "重载 %1 后找不到新的解码器定义，该解码器已保留旧脚本。")
+                        .arg(id);
+            }
+            for (auto &kv : saved) {
+                data::decode::Decoder *dec = kv.first;
+                if (dec_id[dec] != id)
+                    continue;
+                dec->attach_decoder(nd, kv.second);
+                // Options are keyed by the old script's option ids; the new
+                // definition may have renamed or dropped some of them.
+                dec->prune_options(nd);
+            }
+            reloaded.append(id);
         }
 
         _script_baseline = current;
 
+        // Name the script files that were picked up, in the console as well:
+        // this is the only visible proof that the edit was loaded.
+        QStringList details;
+        for (const QString &id : changed) {
+            const QString file = current_file.value(id);
+            details << (file.isEmpty() ? id : QString("%1（%2）").arg(id, file));
+            srd_console_write(qPrintable(
+                    QString("[reload] %1 已重新加载：%2\n")
+                            .arg(id, file.isEmpty() ? QString("(未知路径)") : file)));
+            dsv_info("Reloaded decoder script: %s -> %s", qPrintable(id),
+                    qPrintable(file));
+        }
+
         // Re-decode every trace against the current data.
         for (auto trace : _decode_traces) {
+            // The rows were built from the definition that was just freed;
+            // rebuild them against the re-attached one before the item view
+            // repaints the row headers.
+            trace->decoder()->build_row();
             trace->decoder()->set_options_changed(true);
             add_decode_task(trace);
         }
 
-        return QString("Reloaded %1 decoder(s): %2. Re-decoding...")
-                .arg(changed.size()).arg(changed.join(", "));
+        return QString("已重载 %1 个解码器脚本：%2。正在重新解码...")
+                .arg(changed.size()).arg(details.join("，"));
+    }
+
+    void SigSession::set_decode_debug_limit_ms(int ms)
+    {
+        uint64_t samples = 0;
+        const uint64_t rate = cur_snap_samplerate();
+        if (ms > 0 && rate > 0)
+            samples = (uint64_t)ms * rate / 1000ULL;
+
+        for (auto trace : _decode_traces) {
+            trace->decoder()->set_debug_sample_limit(samples);
+            trace->decoder()->set_options_changed(true);
+            add_decode_task(trace);
+        }
+
+        const QString msg = samples
+                ? QString("[debug] decode range limited to first %1 ms (%2 samples)\n")
+                        .arg(ms).arg(samples)
+                : QString("[debug] decode range restored to all samples\n");
+        srd_console_write(qPrintable(msg));
+        dsv_info("%s", qPrintable(msg.trimmed()));
+    }
+
+    void SigSession::set_auto_reload_scripts(bool enable)
+    {
+        _auto_reload_scripts = enable;
+
+        if (!_script_watcher) {
+            // SigSession is not a QObject, so the watcher/timer own themselves
+            // and the lambdas capture this.
+            _script_watcher = new QFileSystemWatcher();
+
+            QObject::connect(_script_watcher, &QFileSystemWatcher::directoryChanged,
+                    _script_watcher, [this](const QString &) {
+                if (!_auto_reload_scripts || _script_reload_pending)
+                    return;
+                _script_reload_pending = true;
+                // Debounce: editors often emit several events per save.
+                _script_reload_timer->start(700);
+            });
+
+            _script_reload_timer = new QTimer();
+            _script_reload_timer->setSingleShot(true);
+            QObject::connect(_script_reload_timer, &QTimer::timeout, _script_reload_timer, [this]() {
+                _script_reload_pending = false;
+                if (!_auto_reload_scripts) {
+                    _script_reload_attempt = 0;
+                    return;
+                }
+
+                const QString msg = reload_decoder_scripts();
+                const bool reloaded = msg.contains(QString::fromUtf8("已重载"));
+                const bool unchanged = msg == "No decoder scripts have changed.";
+
+                srd_console_write(qPrintable(QString("[auto-reload] %1\n").arg(msg)));
+
+                // A save event can arrive while the editor is still flushing the
+                // file: the syntax pre-check then fails and nothing is reloaded.
+                // Retry a couple of times instead of silently doing nothing,
+                // which is what made a saved edit look like it never took effect.
+                if (!reloaded && !unchanged && !msg.startsWith("Baseline")
+                        && _script_reload_attempt < 2) {
+                    ++_script_reload_attempt;
+                    _script_reload_timer->start(900);
+                    return;
+                }
+
+                _script_reload_attempt = 0;
+            });
+        }
+
+        refresh_script_watcher();
+    }
+
+    void SigSession::refresh_script_watcher()
+    {
+        if (!_script_watcher)
+            return;
+
+        const QString script_dir = GetDecodeScriptDir();
+        if (script_dir.isEmpty())
+            return;
+
+        QSet<QString> wanted;
+        for (auto trace : _decode_traces) {
+            for (auto dec : trace->decoder()->stack()) {
+                const QString mod = QString::fromStdString(dec->module_name());
+                if (mod.isEmpty())
+                    continue;
+                QString path = script_dir + "/" + mod;
+                if (QFileInfo(path).isDir())
+                    wanted.insert(QDir::cleanPath(path));
+            }
+        }
+
+        const QStringList watched = _script_watcher->directories();
+        for (const QString &p : watched) {
+            if (!wanted.contains(p))
+                _script_watcher->removePath(p);
+        }
+        for (const QString &p : wanted) {
+            if (!watched.contains(p))
+                _script_watcher->addPath(p);
+        }
+    }
+
+
+    void SigSession::set_generic_decode_blocked(bool blocked, const QString &reason)
+    {
+        const bool was_blocked = _generic_decode_blocked;
+
+        _generic_decode_blocked = blocked;
+        _generic_decode_block_reason = blocked ? reason : QString();
+
+        if (blocked) {
+            // Stop what already runs and drop what is still queued: a decoder
+            // started before the measurement would keep decoding inside the 1PPS
+            // loop's frames.
+            int running = -1;
+            clear_all_decode_task(running);
+            for (auto trace : _decode_traces)
+                trace->decoder()->stop_decode_work();
+            dsv_info("Generic decode blocked: %s",
+                reason.toLocal8Bit().constData());
+        } else if (was_blocked) {
+            // Measurement finished: bring the decoders back up on the data that
+            // is now in the buffer instead of waiting for the user to click them.
+            // Only when this call actually lifts a block: every plain stop_capture
+            // ends with set_generic_decode_blocked(false), and re-decoding the
+            // whole capture each time is pure cost (and undoes the user's region).
+            for (auto trace : _decode_traces) {
+                trace->decoder()->set_options_changed(true);
+                trace->prepare_decode_region();
+                add_decode_task(trace);
+            }
+            dsv_info("Generic decode unblocked, %d trace(s) re-decoding",
+                (int)_decode_traces.size());
+        }
     }
 
     void SigSession::re_decode_trace(int index)
@@ -2070,8 +2365,12 @@ namespace pv
 
             view::DecodeTrace *trace = _decode_traces[i];
             trace->decoder()->set_options_changed(true);
+            trace->prepare_decode_region();
             add_decode_task(trace);
         }
+
+        // A decoder may have been added since the last refresh.
+        refresh_script_watcher();
     }
 
     void SigSession::clear_all_decoder(bool bUpdateView)
@@ -2139,7 +2438,15 @@ namespace pv
         {
             return _decode_traces[index];
         }
+        dsv_err("Decoder trace index out of range:%d (have %d)",
+                index, (int)_decode_traces.size());
         assert(false);
+        // Returning NULL instead of falling off the end of this non-void
+        // function: in a release build the assert above expands to nothing,
+        // and the garbage return value makes every caller's "trace is null"
+        // guard useless (an out-of-range trace_index from the MCP API crashed
+        // the app in DecodeTrace::decoder()).
+        return NULL;
     }
 
     view::DecodeTrace *SigSession::get_top_decode_task()
@@ -2472,9 +2779,23 @@ namespace pv
                     {
                         de->decoder()->set_capture_end_flag(true);
 
-                        if (bAddDecoder){ 
+                        // Auto decode after a normal trigger. The decoder always
+                        // has to be marked as changed here: the task queued at
+                        // capture start may have ended on an empty buffer and
+                        // consumed that flag, and without it this second run
+                        // returns immediately ("options have not changed") -
+                        // which is exactly the "no decode until the decoder is
+                        // clicked again" behaviour.
+                        if (bAddDecoder && !_generic_decode_blocked){ 
+                            de->decoder()->set_options_changed(true);
                             de->frame_ended();
                             add_decode_task(de);
+                        }
+                        else if (_generic_decode_blocked) {
+                            // The 1PPS measurement keeps the generic decoders
+                            // idle by design; printing a line for every capture
+                            // only flooded the console, so this branch stays
+                            // silent now.
                         }
                     }
 

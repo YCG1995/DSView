@@ -32,6 +32,13 @@
 #include <QDialogButtonBox>
 #include <QScrollArea>
 #include <QApplication>
+#include <QClipboard>
+#include <QPlainTextEdit>
+#include <QDesktopServices>
+#include <QUrl>
+#include <QRegularExpression>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
 #include "decodetrace.h"
 #include "../sigsession.h"
 #include "../data/decoderstack.h"
@@ -516,15 +523,86 @@ void DecodeTrace::draw_error(QPainter &p, const QString &message,
 	const int y = get_y();
     const int h = get_totalHeight();
 
+    // Only the first line fits in the banner; double-click shows the rest.
+    const QString first_line = message.section('\n', 0, 0);
+
     const QRectF text_rect(left, y - h/2 + 0.5, right - left, h);
     const QRectF bounding_rect = p.boundingRect(text_rect,
-            Qt::AlignCenter, message);
+            Qt::AlignCenter, first_line);
     p.setPen(Qt::red);
 
     if (bounding_rect.width() < text_rect.width())
-        p.drawText(text_rect, Qt::AlignCenter, L_S(STR_PAGE_DLG, S_ID(IDS_DLG_DECODETRACE_ERROR1), "Error:")+message);
+        p.drawText(text_rect, Qt::AlignCenter, L_S(STR_PAGE_DLG, S_ID(IDS_DLG_DECODETRACE_ERROR1), "Error:")+first_line);
     else
         p.drawText(text_rect, Qt::AlignCenter, L_S(STR_PAGE_DLG, S_ID(IDS_DLG_DECODETRACE_ERROR2), "Error: ..."));
+}
+
+bool DecodeTrace::mouse_double_click(int right, const QPoint pt)
+{
+    (void)right;
+    (void)pt;
+
+    const QString err = _decoder_stack ? _decoder_stack->error_message()
+                                       : QString();
+    if (err.isEmpty())
+        return false;
+
+    // Pull a script path / line number out of the traceback, if any.
+    // Python prints:  File "C:\...\pd.py", line 87, in decode
+    // Some C-side messages use a shorter "path:line" form.
+    QString script_path;
+    int script_line = -1;
+    const QRegularExpression rx_py(
+            R"(File \"([^\"]+\.py)\", line (\d+))");
+    const QRegularExpression rx_colon(
+            R"(([A-Za-z]:\\[^\s:\"]+\.py|/[^\s:\"]+\.py):(\d+))");
+    const QRegularExpressionMatch m_py = rx_py.match(err);
+    const QRegularExpressionMatch m_colon = rx_colon.match(err);
+    if (m_py.hasMatch()) {
+        script_path = m_py.captured(1);
+        script_line = m_py.captured(2).toInt();
+    } else if (m_colon.hasMatch()) {
+        script_path = m_colon.captured(1);
+        script_line = m_colon.captured(2).toInt();
+    }
+
+    QDialog dlg(QApplication::activeWindow());
+    dlg.setWindowTitle(tr("解码器异常详情"));
+    dlg.resize(760, 420);
+
+    QVBoxLayout *lay = new QVBoxLayout(&dlg);
+
+    QPlainTextEdit *edit = new QPlainTextEdit(&dlg);
+    edit->setReadOnly(true);
+    edit->setPlainText(err);
+    edit->setLineWrapMode(QPlainTextEdit::NoWrap);
+    lay->addWidget(edit, 1);
+
+    QHBoxLayout *btns = new QHBoxLayout();
+    QPushButton *copy_btn = new QPushButton(tr("复制"), &dlg);
+    QPushButton *open_btn = new QPushButton(
+            script_line > 0
+                ? tr("打开脚本（第 %1 行）").arg(script_line)
+                : tr("打开脚本"), &dlg);
+    open_btn->setEnabled(!script_path.isEmpty());
+    QPushButton *close_btn = new QPushButton(tr("关闭"), &dlg);
+
+    btns->addWidget(copy_btn);
+    btns->addWidget(open_btn);
+    btns->addStretch();
+    btns->addWidget(close_btn);
+    lay->addLayout(btns);
+
+    QObject::connect(copy_btn, &QPushButton::clicked, [edit]() {
+        QApplication::clipboard()->setText(edit->toPlainText());
+    });
+    QObject::connect(open_btn, &QPushButton::clicked, [script_path]() {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(script_path));
+    });
+    QObject::connect(close_btn, &QPushButton::clicked, &dlg, &QDialog::accept);
+
+    dlg.exec();
+    return true;
 }
 
 void DecodeTrace::draw_unshown_row(QPainter &p, int y, int h, int left,
@@ -652,6 +730,45 @@ void DecodeTrace::frame_ended()
     }
 
     decoder()->frame_ended();
+
+    for(auto dec : _decoder_stack->stack()) {
+        dec->set_decode_region(_decode_start, _decode_end);
+        dec->commit();
+    }
+}
+
+void DecodeTrace::prepare_decode_region()
+{
+    // cur_samplelimits() is 0 before the first capture (or after a reset), and
+    // subtracting one there wrapped to UINT64_MAX - which then got persisted
+    // into every decoder's region. Ask the snapshot instead when the session
+    // has no limit yet; with nothing at all, leave the region alone.
+    uint64_t last_samples = 0;
+    const uint64_t limit = _session->cur_samplelimits();
+    if (limit > 1) {
+        last_samples = limit - 1;
+    } else {
+        data::Snapshot *base = _session->get_snapshot(SR_CHANNEL_LOGIC);
+        if (base && base->get_sample_count() > 0)
+            last_samples = base->get_sample_count() - 1;
+    }
+
+    // A decoder added after the capture finished never saw frame_ended(),
+    // so its region is still the 0..0 default. Fall back to the whole capture.
+    bool need_range = false;
+    for(auto dec : _decoder_stack->stack()) {
+        if (dec->decode_end() == 0)
+            need_range = true;
+    }
+
+    if (need_range && last_samples != 0) {
+        _decode_start = 0;
+        _decode_end = last_samples;
+    }
+
+    dsv_info("prepare_decode_region: last=%llu need_range=%d start=%llu end=%llu",
+            (unsigned long long)last_samples, need_range ? 1 : 0,
+            (unsigned long long)_decode_start, (unsigned long long)_decode_end);
 
     for(auto dec : _decoder_stack->stack()) {
         dec->set_decode_region(_decode_start, _decode_end);

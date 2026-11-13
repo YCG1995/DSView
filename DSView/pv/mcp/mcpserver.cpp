@@ -69,6 +69,9 @@ static const ToolDef TOOL_DEFS[] = {
 	{"get_console",
 	 "Return captured stdout/stderr text from decoder scripts and optionally clear it.",
 	 R"({"type":"object","properties":{"clear":{"type":"boolean"}}})"},
+	{"get_console_text",
+	 "Return the text currently shown in the decoder console window (what the user sees).",
+	 R"({"type":"object","properties":{}})"},
 	{"read_script",
 	 "Read a file inside a decoder package (default pd.py).",
 	 R"({"type":"object","properties":{"module":{"type":"string"},
@@ -122,6 +125,10 @@ static const ToolDef TOOL_DEFS[] = {
 	 "Reset (clear) the decoder at the given index.",
 	 R"({"type":"object","properties":{"index":{"type":"integer"}},
 	     "required":["index"]})"},
+	{"rerun_decoder",
+	 "Same as the run button on a decoder row: drop the result and decode again.",
+	 R"({"type":"object","properties":{"trace_index":{"type":"integer"}},
+	     "required":["trace_index"]})"},
 	{"list_decoder_stacks",
 	 "List active decoder traces with their rows, options and probe bindings.",
 	 R"({"type":"object","properties":{}})"},
@@ -418,6 +425,8 @@ QJsonObject McpServer::dispatch(const QJsonObject &request, bool &notification)
 			result = tool_get_status(args);
 		else if (name == "get_console")
 			result = tool_get_console(args);
+		else if (name == "get_console_text")
+			result = tool_get_console_text(args);
 		else if (name == "read_script")
 			result = tool_read_script(args);
 		else if (name == "write_script")
@@ -444,6 +453,8 @@ QJsonObject McpServer::dispatch(const QJsonObject &request, bool &notification)
 			result = tool_remove_decoder(args);
 		else if (name == "reset_decoder")
 			result = tool_reset_decoder(args);
+		else if (name == "rerun_decoder")
+			result = tool_rerun_decoder(args);
 		else if (name == "list_decoder_stacks")
 			result = tool_list_decoder_stacks(args);
 		else if (name == "get_decoder_options")
@@ -622,6 +633,8 @@ QJsonObject McpServer::tool_get_status(const QJsonObject &)
 		o["sample_rate"] = qint64(stack->sample_rate());
 		o["progress"] = stack->get_progress();
 		o["result_count"] = qint64(stack->get_result_count());
+		// The row error text the user sees; empty means the row shows no error.
+		o["error"] = stack->error_message();
 		arr.append(o);
 	}
 
@@ -636,6 +649,13 @@ QJsonObject McpServer::tool_get_console(const QJsonObject &args)
 	const QString text = QString::fromUtf8(raw ? raw : "");
 	g_free(raw);
 	return text_result(text);
+}
+
+QJsonObject McpServer::tool_get_console_text(const QJsonObject &)
+{
+	if (!_console)
+		return text_result("Console window is not available.", true);
+	return text_result(_console->console_text());
 }
 
 static bool unsafe_name(const QString &s)
@@ -872,6 +892,34 @@ QJsonObject McpServer::tool_set_sample_config(const QJsonObject &args)
 
 // ---------- decoder management ----------
 
+// Find the decoder which produces the given protocol output, so that a
+// stacked decoder can be added with the same base chain the UI builds.
+static srd_decoder *mcp_decoder_by_output(const char *output)
+{
+	for (const GSList *l = srd_decoder_list(); l; l = l->next) {
+		srd_decoder *d = (srd_decoder *)l->data;
+		for (const GSList *o = d->outputs; o; o = o->next) {
+			const char *name = (const char *)o->data;
+			if (!name || strcmp(name, output))
+				continue;
+			// Same rule as ProtocolDock::get_output_protocol_by_id(): the
+			// "0:xxx" variants only draw annotations, they never emit
+			// Python protocol data, so they cannot feed a stacked decoder.
+			if (QString::fromUtf8(d->id).startsWith(QLatin1String("0:")))
+				continue;
+			return d;
+		}
+	}
+	return NULL;
+}
+
+static const char *mcp_first_input(const srd_decoder *dec)
+{
+	if (!dec || !dec->inputs)
+		return NULL;
+	return (const char *)dec->inputs->data;
+}
+
 QJsonObject McpServer::tool_add_decoder(const QJsonObject &args)
 {
 	const QString name = args.value("name").toString();
@@ -882,10 +930,42 @@ QJsonObject McpServer::tool_add_decoder(const QJsonObject &args)
 	if (!dec)
 		return text_result("Decoder not found: " + name, true);
 
-	DecoderStatus *dstatus = new DecoderStatus();
 	std::list<data::decode::Decoder *> subs;
+	srd_decoder *root = dec;
+	QStringList chain;
+
+	// Stacked decoder: resolve the base chain (logic -> ... -> this decoder).
+	const char *input = mcp_first_input(dec);
+	if (input && QString::fromUtf8(input) != QLatin1String("logic")) {
+		subs.push_front(new data::decode::Decoder(dec));
+		srd_decoder *base = mcp_decoder_by_output(input);
+		while (base) {
+			const char *base_input = mcp_first_input(base);
+			if (!base_input)
+				break;
+			if (QString::fromUtf8(base_input) == QLatin1String("logic")) {
+				root = base;
+				break;
+			}
+			subs.push_front(new data::decode::Decoder(base));
+			base = mcp_decoder_by_output(base_input);
+			root = NULL;
+		}
+		if (!root) {
+			for (auto *s : subs)
+				delete s;
+			return text_result("No base decoder produces protocol '"
+					+ QString::fromUtf8(input) + "' for " + name, true);
+		}
+		chain = QStringList() << QString::fromUtf8(root->id);
+		for (auto *s : subs)
+			chain << QString::fromUtf8(s->id());
+	}
+
+	DecoderStatus *dstatus = new DecoderStatus();
 	view::Trace *out = NULL;
-	const bool ok = _session->add_decoder(dec, true, dstatus, subs, out);
+	const bool ok = _session->add_decoder(root, true, dstatus, subs, out);
+	subs.clear();
 	if (!ok) {
 		delete dstatus;
 		return text_result("Failed to add decoder: " + name, true);
@@ -893,6 +973,8 @@ QJsonObject McpServer::tool_add_decoder(const QJsonObject &args)
 
 	// Re-decode against the current data.
 	_session->re_decode_trace();
+	if (!chain.isEmpty())
+		return text_result("Added decoder stack " + chain.join(" -> ") + ".");
 	return text_result("Added decoder " + name + ".");
 }
 
@@ -913,6 +995,22 @@ QJsonObject McpServer::tool_reset_decoder(const QJsonObject &args)
 	// Re-run decoding without the modal options dialog that rst_decoder opens.
 	_session->re_decode_trace(index);
 	return text_result("Reset decoder at index " + QString::number(index));
+}
+
+QJsonObject McpServer::tool_rerun_decoder(const QJsonObject &args)
+{
+	const int index = args.value("trace_index").toInt(-1);
+	if (index < 0)
+		return text_result("Missing trace_index.", true);
+
+	const auto &traces = _session->get_decode_signals();
+	if (index >= (int)traces.size())
+		return text_result("trace_index out of range.", true);
+
+	// Exactly what the run button does.
+	void *handel = traces[index]->decoder()->get_key_handel();
+	_session->rerun_decoder_by_key_handel(handel);
+	return text_result("Re-run decoder at trace " + QString::number(index));
 }
 
 QJsonObject McpServer::tool_list_decoder_stacks(const QJsonObject &)
@@ -1032,6 +1130,8 @@ QJsonObject McpServer::tool_set_decoder_option(const QJsonObject &args)
 
 	GVariant *gv = json_to_gv(value, ref_type);
 	target->set_option(option.toUtf8().constData(), gv);
+	// Same as probes: options are staged until commit().
+	target->commit();
 	_session->re_decode_trace(trace_index);
 	return text_result("Set " + option + " and re-decoding.");
 }
@@ -1063,7 +1163,20 @@ QJsonObject McpServer::tool_bind_probe(const QJsonObject &args)
 				found = true;
 			}
 		}
+		// Optional channels (e.g. spi mosi/miso/cs, uart rx/tx) are just as
+		// bindable; they simply may stay unassigned.
+		for (GSList *l = sd->opt_channels; l; l = l->next) {
+			const srd_channel *pdch =
+					static_cast<const srd_channel *>(l->data);
+			if (!pdch->id || channel != pdch->id)
+				continue;
+			probe_map[pdch] = probe_index;
+			found = true;
+		}
 		dec->set_probes(probe_map);
+		// set_probes() only stages the binding; the decode thread reads the
+		// committed copy, so commit() must run before re-decoding.
+		dec->commit();
 	}
 
 	if (!found)

@@ -1290,16 +1290,233 @@ SRD_API int srd_decoder_reload(const char *module_name)
 	srd_err("reload: purged %d sys.modules entries.", purged);
 	PyGILState_Release(gstate);
 
-	/* Unload (frees all instances globally) and re-import. */
-	ret = srd_decoder_unload(dec);
-	if (ret != SRD_OK) {
-		srd_err("reload: srd_decoder_unload returned %d.", ret);
-		return ret;
-	}
-	srd_err("reload: unloaded, now re-importing.");
+	/*
+	 * Detach the old definition from the loaded list but do NOT free it yet.
+	 *
+	 * The frontend still holds this srd_decoder and the srd_channel pointers
+	 * inside it until it has attached the freshly imported one. Freeing it
+	 * before the re-import has succeeded would leave those pointers dangling
+	 * whenever the new script compiles but fails at import time (a missing
+	 * dependency, an exception at package level, ...) - and the frontend has
+	 * no way to notice. Keeping the old definition alive turns a failed
+	 * reload into "the previous version keeps working" instead of a crash.
+	 */
+	pd_list = g_slist_remove(pd_list, dec);
 
 	ret = srd_decoder_load(module_name);
-	srd_err("reload: srd_decoder_load returned %d.", ret);
+	if (ret == SRD_OK) {
+		/*
+		 * srd_decoder_load() returns SRD_OK without doing anything when the
+		 * module is still in sys.modules, so success alone does not prove a
+		 * new definition is there: check the list for a *different* object.
+		 */
+		struct srd_decoder *fresh = get_decoder_by_module_name(module_name);
+
+		if (!fresh || fresh == dec) {
+			srd_err("reload: re-import produced no new decoder for '%s'.",
+				module_name);
+			ret = SRD_ERR;
+		}
+	}
+
+	if (ret != SRD_OK) {
+		pd_list = g_slist_prepend(pd_list, dec);
+		srd_err("reload: re-import failed (%d), keeping the previous decoder.",
+			ret);
+		return ret;
+	}
+	srd_err("reload: re-imported, releasing the previous decoder.");
+
+	/*
+	 * The new definition is in place, so the old one can go. Instances may
+	 * live in any stack of any session, hence the global sweep.
+	 */
+	for (GSList *l = sessions; l; l = l->next)
+		srd_inst_free_all((struct srd_session *)l->data);
+
+	decoder_free(dec);
+	return SRD_OK;
+}
+
+/* Locate the main script of a decoder package in the registered search
+ * paths. Returns a newly allocated path, or NULL when nothing matches. */
+static char *srd_decoder_find_script(const char *module_name)
+{
+	GSList *l;
+	char *pkg, *mod_py, *cand;
+
+	pkg = g_strdup_printf("%s/__init__.py", module_name);
+	mod_py = g_strdup_printf("%s.py", module_name);
+	for (l = srd_searchpaths_get(); l; l = l->next) {
+		const char *dir = (const char *)l->data;
+
+		cand = g_build_filename(dir, pkg, NULL);
+		if (g_file_test(cand, G_FILE_TEST_EXISTS)) {
+			g_free(pkg);
+			g_free(mod_py);
+			return cand;
+		}
+		g_free(cand);
+
+		cand = g_build_filename(dir, module_name, mod_py, NULL);
+		if (g_file_test(cand, G_FILE_TEST_EXISTS)) {
+			g_free(pkg);
+			g_free(mod_py);
+			return cand;
+		}
+		g_free(cand);
+	}
+	g_free(pkg);
+	g_free(mod_py);
+	return NULL;
+}
+
+/* Returns a newly allocated UTF-8 copy of a Python unicode object. */
+static char *py_unicode_dup(PyObject *obj)
+{
+	PyObject *bytes;
+	char *s;
+
+	if (!obj)
+		return NULL;
+	bytes = PyUnicode_AsUTF8String(obj);
+	if (!bytes)
+		return NULL;
+	s = g_strdup(PyBytes_AsString(bytes));
+	Py_DECREF(bytes);
+	return s;
+}
+
+/* Compile one script file (GIL must be held). Returns SRD_OK when it parses. */
+static int srd_check_script_syntax(const char *path, char **error)
+{
+	char *code = NULL;
+	PyObject *co = NULL, *etype = NULL, *evalue = NULL, *etb = NULL;
+	int ret = SRD_OK;
+
+	if (!g_file_get_contents(path, &code, NULL, NULL)) {
+		if (error)
+			*error = g_strdup_printf("Cannot read script: %s", path);
+		return SRD_ERR;
+	}
+
+	co = Py_CompileString(code, path, Py_file_input);
+	if (!co) {
+		PyErr_Fetch(&etype, &evalue, &etb);
+		PyErr_NormalizeException(&etype, &evalue, &etb);
+
+		if (error) {
+			/* SyntaxError carries position details. */
+			PyObject *plineno = PyObject_GetAttrString(evalue, "lineno");
+			PyObject *ptext = PyObject_GetAttrString(evalue, "text");
+			PyObject *pmsg = PyObject_GetAttrString(evalue, "msg");
+			char *msg = NULL, *text = NULL;
+
+			long lineno = plineno ? PyLong_AsLong(plineno) : -1;
+			msg = (pmsg && PyUnicode_Check(pmsg))
+					? py_unicode_dup(pmsg) : NULL;
+			text = (ptext && PyUnicode_Check(ptext))
+					? py_unicode_dup(ptext) : NULL;
+
+			if (lineno > 0)
+				*error = g_strdup_printf(
+					"Syntax error in %s line %ld: %s\n%4ld | %s",
+					path, lineno, msg ? msg : "invalid syntax",
+					lineno, text ? text : "");
+			else
+				*error = g_strdup_printf("Compile failed in %s: %s",
+					path, msg ? msg : "invalid syntax");
+
+			g_free(msg);
+			g_free(text);
+			Py_XDECREF(plineno);
+			Py_XDECREF(ptext);
+			Py_XDECREF(pmsg);
+		}
+
+		PyErr_Clear();
+		ret = SRD_ERR;
+	}
+
+	Py_XDECREF(co);
+	Py_XDECREF(etb);
+	Py_XDECREF(evalue);
+	Py_XDECREF(etype);
+	g_free(code);
+
+	return ret;
+}
+
+/**
+ * Compile-check a decoder script without importing it.
+ *
+ * @param module_name The decoder package directory name (e.g. "0-i2c").
+ * @param error       If non-NULL, receives a human readable diagnostic
+ *                    containing the script path, line number and source text.
+ *
+ * @return SRD_OK if the script compiles, SRD_ERR on syntax/IO errors.
+ */
+SRD_API int srd_decoder_check(const char *module_name, char **error){
+	char *path = NULL, *dir = NULL, *code = NULL;
+	GDir *gd = NULL;
+	const char *fn;
+	gboolean checked_any = FALSE;
+	PyGILState_STATE gstate;
+	int ret = SRD_OK;
+
+	if (error)
+		*error = NULL;
+
+	if (!module_name)
+		return SRD_ERR_ARG;
+
+	path = srd_decoder_find_script(module_name);
+	if (!path) {
+		if (error)
+			*error = g_strdup_printf("Decoder script not found: %s",
+					module_name);
+		return SRD_ERR;
+	}
+	dir = g_path_get_dirname(path);
+
+	/* A package can be split over several files (Decoders declare
+	 * __init__ plus one or more implementation modules), so compiling only
+	 * the entry file would miss most real syntax errors. */
+	gd = g_dir_open(dir, 0, NULL);
+
+	gstate = PyGILState_Ensure();
+
+	if (gd) {
+		while ((fn = g_dir_read_name(gd)) != NULL && ret == SRD_OK) {
+			char *file;
+
+			if (!g_str_has_suffix(fn, ".py"))
+				continue;
+			file = g_build_filename(dir, fn, NULL);
+			checked_any = TRUE;
+			ret = srd_check_script_syntax(file, error);
+			g_free(file);
+		}
+	} else {
+		ret = srd_check_script_syntax(path, error);
+	}
+
+	PyGILState_Release(gstate);
+
+	if (gd)
+		g_dir_close(gd);
+
+	if (ret == SRD_OK && !checked_any) {
+		if (error)
+			*error = g_strdup_printf("Decoder script not found: %s",
+					module_name);
+		ret = SRD_ERR;
+	}
+
+	g_free(code);
+	g_free(dir);
+	g_free(path);
+
 	return ret;
 }
 

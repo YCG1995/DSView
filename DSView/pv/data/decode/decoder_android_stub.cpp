@@ -157,6 +157,16 @@ int srd_decoder_reload(const char *id)
 	return 0;
 }
 
+int srd_decoder_check(const char *module_name, char **error)
+{
+	(void)module_name;
+	if (error)
+		*error = nullptr;
+	return 0;
+}
+
+void srd_console_write(const char *text) { (void)text; }
+
 /* ---- 会话级接口：Android 无 Python 时全部按"空会话"处理 ---- */
 
 int srd_init(const char *path) { (void)path; return 0; }

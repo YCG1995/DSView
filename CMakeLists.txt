@@ -32,6 +32,14 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
 	add_definitions(-DNDEBUG)
 endif()
 
+# Head-less UI test hooks (pv/pps/ppstesthooks.h). Off by default so a release
+# build never reacts to stray DSVIEW_* environment variables; configure with
+# -DDSVIEW_TEST_HOOKS=ON to build a test binary that honours them.
+option(DSVIEW_TEST_HOOKS "Enable head-less UI test hooks (DSVIEW_* env vars)" OFF)
+if(DSVIEW_TEST_HOOKS)
+	add_definitions(-DDSVIEW_TEST_HOOKS=1)
+endif()
+
 
 #===============================================================================
 #= Config Header
@@ -317,6 +325,7 @@ set(DSView_SOURCES
     DSView/pv/dock/triggerdock.cpp
     DSView/pv/dock/measuredock.cpp
     DSView/pv/dock/searchdock.cpp
+    DSView/pv/dock/decoderconsoledock.cpp
     DSView/pv/toolbars/logobar.cpp
     DSView/pv/dialogs/about.cpp
     DSView/pv/dialogs/search.cpp
@@ -440,6 +449,7 @@ set(DSView_HEADERS
     DSView/pv/dock/triggerdock.h
     DSView/pv/dock/measuredock.h
     DSView/pv/dock/searchdock.h
+    DSView/pv/dock/decoderconsoledock.h
     DSView/pv/toolbars/logobar.h
     DSView/pv/dialogs/about.h
     DSView/pv/dialogs/search.h
@@ -736,6 +746,8 @@ if(ANDROID)
 	list(APPEND DSView_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/DSView/pv/android/android_usb.cpp")
 	# APK assets（CPython 标准库 / 解码器脚本）落地到应用私有目录
 	list(APPEND DSView_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/DSView/pv/android/android_assets.cpp")
+	# 触屏（手机）界面适配：可点区域放大、对话框不超屏、样式覆盖层
+	list(APPEND DSView_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/DSView/pv/android/android_ui.cpp")
 endif()
 
 add_executable(${PROJECT_NAME}

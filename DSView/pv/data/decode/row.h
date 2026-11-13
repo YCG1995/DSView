@@ -67,6 +67,17 @@ private:
 	const srd_decoder *_decoder;
 	const srd_decoder_annotation_row *_row;
     int _order; 
+
+    // The decoder definition is freed by srd_decoder_reload() once the new
+    // script has been imported, but these Row objects live on in the stack's
+    // _rows / _rows_show / _class_rows maps and are repainted by the item view
+    // straight afterwards. Keeping the text instead of reading it out of
+    // _decoder / _row on demand is what makes that safe: title() used to run
+    // strlen() on the freed definition and crashed the app on the next repaint.
+    QString _title;
+    QString _title_id;
+
+    void cache_text();
 };
 
 } // decode

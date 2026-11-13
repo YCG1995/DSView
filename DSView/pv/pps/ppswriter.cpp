@@ -16,7 +16,9 @@ PpsWriter::PpsWriter() {}
 
 QString PpsWriter::build_file_name(const QDateTime &dt)
 {
-	return "PPS_" + dt.toString("yyyyMMdd_HHmmss") + ".csv";
+	// Milliseconds included: a stop/start inside the same second used to reuse
+	// the previous file name, and the new run was appended to the old data.
+	return "PPS_" + dt.toString("yyyyMMdd_HHmmss_zzz") + ".csv";
 }
 
 static QString format_ns(double v)
@@ -46,7 +48,7 @@ bool PpsWriter::write_frame(const QString &file_path,
 	// Qt6: QTextStream 默认 UTF-8，不再需要 setCodec
 	if (need_header) {
 		out.setGenerateByteOrderMark(true);
-		out << QString::fromUtf8("触发时间戳(ms)");
+		out << QString::fromUtf8("触发时间");
 		for (const PpsChannel &ch : config.channels)
 			out << ",CH" << ch.channel_index;
 		out << "\n";

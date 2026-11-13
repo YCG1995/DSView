@@ -93,7 +93,9 @@ MeasureDock::MeasureDock(QWidget *parent, View &view, SigSession *session) :
 
     /* cursor distance group */
     _dist_groupBox = new QGroupBox(_widget);
+#if !defined(Q_OS_ANDROID)
     _dist_groupBox->setMinimumWidth(300);
+#endif
     _dist_add_btn = new XToolButton(_widget);   
 
     _dist_layout = new QGridLayout(_widget);
@@ -110,7 +112,9 @@ MeasureDock::MeasureDock(QWidget *parent, View &view, SigSession *session) :
 
     /* cursor edges group */
     _edge_groupBox = new QGroupBox(_widget);
+#if !defined(Q_OS_ANDROID)
     _edge_groupBox->setMinimumWidth(300);
+#endif
     _edge_add_btn = new XToolButton(_widget);
 
     _channel_label = new QLabel(_widget);
@@ -146,7 +150,14 @@ MeasureDock::MeasureDock(QWidget *parent, View &view, SigSession *session) :
     _widget->setLayout(layout);
 
     this->setWidget(_widget);
+#if defined(Q_OS_ANDROID)
+    /* 手机上没有横向滚动的意义：内容宽度跟随视口，只保留纵向滚动。
+     * 桌面版靠 sizeHint 定宽 + 横向滚动条，手机上会切掉右侧内容。 */
+    setWidgetResizable(true);
+    setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+#else
     _widget->setGeometry(0, 0, sizeHint().width(), 2000);
+#endif
     _widget->setObjectName("measureWidget");
 
     add_dist_measure();
@@ -307,6 +318,13 @@ void MeasureDock::build_dist_pannel()
 
         s_btn->setFixedWidth(bt_w);
         e_btn->setFixedWidth(bt_w);
+#if defined(Q_OS_ANDROID)
+
+        /* 手机端光标按钮要能点：给足 40dp 触控热区，固定高度避免被行高拉成长条 */
+
+        s_btn->setFixedSize(qMax(bt_w, 40), 40);
+        e_btn->setFixedSize(qMax(bt_w, 40), 40);
+#endif
 
         lay->addWidget(row_widget, dex++, 0, 1, 7);
 
@@ -453,6 +471,13 @@ void MeasureDock::build_edge_pannel()
 
         s_btn->setFixedWidth(bt_w);
         e_btn->setFixedWidth(bt_w);
+#if defined(Q_OS_ANDROID)
+
+        /* 手机端光标按钮要能点：给足 40dp 触控热区，固定高度避免被行高拉成长条 */
+
+        s_btn->setFixedSize(qMax(bt_w, 40), 40);
+        e_btn->setFixedSize(qMax(bt_w, 40), 40);
+#endif
 
         lay->addWidget(row_widget, dex++, 0, 1, 7);
 

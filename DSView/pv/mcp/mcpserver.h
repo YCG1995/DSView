@@ -50,6 +50,19 @@ public:
 	virtual QJsonObject pps_status() = 0;
 };
 
+/*
+ * The decoder console window's own text. The dock consumes the shared console
+ * buffer every poll, so get_console() only sees lines written while the dock
+ * was not polling; reading the widget is the only way to check what the user
+ * would actually see.
+ */
+class IConsoleTextProvider
+{
+public:
+	virtual ~IConsoleTextProvider() {}
+	virtual QString console_text() const = 0;
+};
+
 class McpServer : public QObject
 {
 	Q_OBJECT
@@ -62,6 +75,7 @@ public:
 	void set_view(view::View *view) { _view = view; }
 	void set_data_getter(ISessionDataGetter *getter) { _data_getter = getter; }
 	void set_pps_control(IPpsControl *pps) { _pps = pps; }
+	void set_console_text(IConsoleTextProvider *console) { _console = console; }
 
 
 	static QJsonObject text_result(const QString &text, bool is_error = false);
@@ -83,6 +97,7 @@ private:
 	QJsonObject tool_open_dsl(const QJsonObject &args);
 	QJsonObject tool_get_status(const QJsonObject &args);
 	QJsonObject tool_get_console(const QJsonObject &args);
+	QJsonObject tool_get_console_text(const QJsonObject &args);
 	QJsonObject tool_read_script(const QJsonObject &args);
 	QJsonObject tool_write_script(const QJsonObject &args);
 
@@ -100,6 +115,9 @@ private:
 	QJsonObject tool_add_decoder(const QJsonObject &args);
 	QJsonObject tool_remove_decoder(const QJsonObject &args);
 	QJsonObject tool_reset_decoder(const QJsonObject &args);
+	// Same code path as the per-row run button: clears the results and re-runs
+	// one decoder on the data already in the buffer.
+	QJsonObject tool_rerun_decoder(const QJsonObject &args);
 	QJsonObject tool_list_decoder_stacks(const QJsonObject &args);
 	QJsonObject tool_get_decoder_options(const QJsonObject &args);
 	QJsonObject tool_set_decoder_option(const QJsonObject &args);
@@ -129,6 +147,7 @@ private:
 	view::View *_view;
 	ISessionDataGetter *_data_getter;
 	IPpsControl *_pps;
+	IConsoleTextProvider *_console;
 	QHash<QTcpSocket *, QByteArray> _buffers;
 };
 

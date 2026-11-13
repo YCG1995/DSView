@@ -745,12 +745,13 @@ static int get_term_type(const char *v)
  * @return A newly allocated PyTuple containing the pin values at the
  *         current sample number.
  */
-static int get_current_pinvalues(const struct srd_decoder_inst *di)
+static int get_current_pinvalues(struct srd_decoder_inst *di)
 {
 	int i;
 	uint8_t sample;
 	const uint8_t *sample_pos;
     int bit_offset;
+	PyObject *vals;
 	PyGILState_STATE gstate;
 
 	if (!di) {
@@ -760,25 +761,42 @@ static int get_current_pinvalues(const struct srd_decoder_inst *di)
 
 	gstate = PyGILState_Ensure();
 
+	/*
+	 * Always build a fresh tuple. Reusing di->py_pinvalues and rewriting it
+	 * with PyTuple_SetItem() breaks as soon as a previous wait() result is
+	 * still referenced from Python (e.g. "vals = self.wait(...)" in a loop):
+	 * PyTuple_SetItem() refuses tuples with a refcount > 1 and leaves a
+	 * SystemError pending, so the next wait() returns a tuple with an
+	 * exception set ("returned a result with an exception set").
+	 */
+	vals = PyTuple_New(di->dec_num_channels);
+	if (!vals) {
+		PyGILState_Release(gstate);
+		return SRD_ERR_MALLOC;
+	}
+
 	for (i = 0; i < di->dec_num_channels; i++) {
 		/* A channelmap value of -1 means "unused optional channel". */
 		if (di->dec_channelmap[i] == -1) {
 			/* Value of unused channel is 0xff, instead of 0 or 1. 
 			   Done set -1 by srd_inst_channel_set_all()
 			*/
-            PyTuple_SetItem(di->py_pinvalues, i, PyLong_FromLong(0xff));
+            PyTuple_SetItem(vals, i, PyLong_FromLong(0xff));
 		} else {
             if (*(di->inbuf + i) == NULL) {
                 sample = *(di->inbuf_const + i) ? 1 : 0;
-                PyTuple_SetItem(di->py_pinvalues, i, PyLong_FromLong(sample));
+                PyTuple_SetItem(vals, i, PyLong_FromLong(sample));
             } else {
                 sample_pos = *(di->inbuf + i) + ((di->abs_cur_samplenum - di->abs_start_samplenum) / 8);
                 bit_offset = (di->abs_cur_samplenum - di->abs_start_samplenum) % 8;
                 sample = *sample_pos & (1 << bit_offset) ? 1 : 0;
-                PyTuple_SetItem(di->py_pinvalues, i, PyLong_FromLong(sample));
+                PyTuple_SetItem(vals, i, PyLong_FromLong(sample));
             }
 		}
 	}
+
+	Py_XDECREF(di->py_pinvalues);
+	di->py_pinvalues = vals;
 
 	PyGILState_Release(gstate);
 
@@ -1123,9 +1141,13 @@ static PyObject *Decoder_wait(PyObject *self, PyObject *args)
 
             g_mutex_unlock(&di->data_mutex);
 
+            /* The reference has to be taken while the GIL is still held: another
+             * thread may replace (and drop) di->py_pinvalues right after it is
+             * released, and an INCREF on a zero-ref object is a use-after-free. */
+            Py_INCREF(di->py_pinvalues);
+
             PyGILState_Release(gstate);
 
-            Py_INCREF(di->py_pinvalues);
             return (PyObject *)di->py_pinvalues;
         } 
  

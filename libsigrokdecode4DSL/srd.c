@@ -29,6 +29,13 @@
 /* Python module search paths */
 SRD_PRIV GSList *searchpaths = NULL;
 
+/* True between a successful Py_InitializeEx() and Py_Finalize(). The console
+ * helpers below touch the Python API unconditionally, and the frontend keeps
+ * posting decoder-console lines while it shuts down (error paths in
+ * DecodeStack, reload diagnostics) - after srd_exit() those calls would take
+ * the GIL of a finalized interpreter. */
+static gboolean s_py_ready = FALSE;
+
 /* session.c */
 extern SRD_PRIV GSList *sessions;
 extern SRD_PRIV int max_session_id;
@@ -74,12 +81,21 @@ static void install_console_capture(void)
 		return;
 	}
 
-	res = PyEval_EvalCode(code_obj, PyEval_GetBuiltins(),
-			PyEval_GetBuiltins());
-	Py_XDECREF(res);
+	PyObject *globals = PyEval_GetGlobals();
+
+	/* Called from srd_init(), i.e. with no Python frame executing, so there are
+	 * no globals to borrow: fall back to the builtins dict, which is what this
+	 * always used and what the snippet needs for `import sys` to resolve. */
+	if (!globals)
+		globals = PyEval_GetBuiltins();
+
+	res = PyEval_EvalCode(code_obj, globals, PyEval_GetBuiltins());
 	Py_DECREF(code_obj);
-	if (!res)
+	if (!res) {
 		PyErr_Clear();
+		return;
+	}
+	Py_DECREF(res);
 }
 
 SRD_API char *srd_console_take(int do_clear)
@@ -88,6 +104,9 @@ SRD_API char *srd_console_take(int do_clear)
 	const char *text;
 	char *result;
 	PyGILState_STATE gstate;
+
+	if (!s_py_ready)
+		return g_strdup("");
 
 	gstate = PyGILState_Ensure();
 
@@ -116,6 +135,29 @@ SRD_API void srd_console_clear(void)
 {
 	char *p = srd_console_take(1);
 	g_free(p);
+}
+
+/* Append text to the same buffer decoder scripts write to, so the C/Qt side
+ * can post build/reload diagnostics into the decoder console. */
+SRD_API void srd_console_write(const char *text)
+{
+	PyObject *sys_mod, *cap;
+	PyGILState_STATE gstate;
+
+	if (!text || !s_py_ready)
+		return;
+
+	gstate = PyGILState_Ensure();
+	sys_mod = PyImport_AddModule("sys");
+	cap = sys_mod ? PyObject_GetAttrString(sys_mod, "_dsview_console") : NULL;
+	if (cap) {
+		PyObject *r = PyObject_CallMethod(cap, "write", "s", text);
+		Py_XDECREF(r);
+		if (PyErr_Occurred())
+			PyErr_Clear();
+	}
+	Py_XDECREF(cap);
+	PyGILState_Release(gstate);
 }
 
 /** @endcond */
@@ -291,6 +333,7 @@ SRD_API int srd_init(const char *path)
 
 	/* Initialize the Python interpreter. */
     Py_InitializeEx(0); 
+	s_py_ready = TRUE;
 
 	/* Capture decoder print() output for the MCP console tool. */
 	install_console_capture();
@@ -398,6 +441,7 @@ SRD_API int srd_exit(void)
 
 	/* Py_Finalize() returns void, any finalization errors are ignored. */
 	Py_Finalize();
+	s_py_ready = FALSE;
 
 	/* Note: No need to release the GIL since Python is shut down now. */
 

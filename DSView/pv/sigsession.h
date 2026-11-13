@@ -32,6 +32,8 @@
 #include <thread>
 #include <atomic>
 #include <QDateTime>
+#include <QFileSystemWatcher>
+#include <QTimer>
 #include <list>
 
 #include "view/mathtrace.h"
@@ -238,6 +240,9 @@ public:
 
     void rst_decoder(int index); 
     void rst_decoder_by_key_handel(void *handel);
+    // Re-run one decoder against the data already in the buffer, without the
+    // option dialog. Used by the per-row run button of the protocol dock.
+    void rerun_decoder_by_key_handel(void *handel);
 
     inline pv::data::DecoderModel* get_decoder_model(){
          return _decoder_model;
@@ -417,6 +422,14 @@ public:
         _callback->data_updated();
     }
 
+    // Rebuild the channel rows from the current probe list. The 1PPS manager uses
+    // it after switching the channel mode or changing probe enables, so rows for
+    // channels that are no longer there stop showing as switched on.
+    void reload_signals(){
+        reload();
+        _callback->signals_changed();
+    }
+
     void auto_end();
     bool have_hardware_data();
     struct ds_device_base_info* get_device_list(int &out_count, int &actived_index);
@@ -482,9 +495,26 @@ public:
     // Reload only the protocol decoder packages whose script files changed.
     QString reload_decoder_scripts();
 
+    // Debug helpers for free-form decoder script writing.
+    // ms <= 0 restores full-range decoding.
+    void set_decode_debug_limit_ms(int ms);
+    void set_auto_reload_scripts(bool enable);
+    inline bool auto_reload_scripts(){ return _auto_reload_scripts; }
+    void refresh_script_watcher();
+
     // Re-run the decode for the trace at index (or all traces when index < 0)
     // after options or probes were changed programmatically.
     void re_decode_trace(int index = -1);
+
+    // 1PPS measurement owns the device with its own synchronous C decoder. While
+    // it runs the generic Python decoders must neither be added nor decoded: they
+    // would compete for time with the measurement loop and can only ever see a
+    // partial frame. Start/stop of the measurement toggles this.
+    void set_generic_decode_blocked(bool blocked, const QString &reason = QString());
+    inline bool generic_decode_blocked(){ return _generic_decode_blocked; }
+    inline const QString &generic_decode_block_reason(){
+        return _generic_decode_block_reason;
+    }
 
     inline void set_capture_work_time(uint64_t tm){
         _capture_work_time = tm;
@@ -598,6 +628,13 @@ private:
     std::vector<view::DecodeTrace*> _decode_traces;
     std::vector<view::DecodeTrace*> _decode_tasks;
     QMap<QString, QDateTime> _script_baseline; // decoder package -> latest script mtime
+    QFileSystemWatcher     *_script_watcher = nullptr;
+    QTimer                 *_script_reload_timer = nullptr;
+    bool                    _auto_reload_scripts = true;
+    bool                    _script_reload_pending = false;
+    int                     _script_reload_attempt = 0;
+    bool                    _generic_decode_blocked = false;
+    QString                 _generic_decode_block_reason;
     pv::data::DecoderModel          *_decoder_model;
     std::vector<view::SpectrumTrace*> _spectrum_traces;
     view::LissajousTrace            *_lissajous_trace;

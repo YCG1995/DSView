@@ -38,6 +38,8 @@
 #include <QDialog>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QPointer>
+#include <QDebug>
 #include <QScreen>
 #include <QTimer>
 #include <libusb-1.0/libusb.h>
@@ -57,6 +59,9 @@
 #endif
 
 #include "mainwindow.h"
+#if defined(Q_OS_ANDROID)
+#include "android/android_ui.h"
+#endif
 
 #include "data/logicsnapshot.h"
 #include "data/dsosnapshot.h"
@@ -79,6 +84,7 @@
 #include "dock/measuredock.h"
 #include "dock/ppsresultdock.h"
 #include "pps/ppsmanager.h"
+#include "pps/ppstesthooks.h"
 #include "pps/ppscalibration.h"
 #include "pps/ppswavewindow.h"
 #include "dialogs/ppsconfigdlg.h"
@@ -88,6 +94,7 @@
 #include <QJsonArray>
 #include "dock/searchdock.h"
 #include "dock/protocoldock.h"
+#include "dock/decoderconsoledock.h"
 
 #include "view/view.h"
 #include "view/trace.h"
@@ -175,7 +182,10 @@ namespace pv
         _mcp_server->set_view(_view);  // _view is created in setup_ui() above
         _mcp_server->set_data_getter(this);  // MainWindow implements ISessionDataGetter
         _mcp_server->set_pps_control(this);  // ... and mcp::IPpsControl (1PPS mode)
+        _mcp_server->set_console_text(this); // ... and mcp::IConsoleTextProvider
         quint16 mcp_port = 6347;
+        // Not a test hook: the MCP listener port is a real deployment option,
+        // so it stays read even in release builds.
         const QByteArray env_port = qgetenv("DSVIEW_MCP_PORT");
         if (!env_port.isEmpty())
             mcp_port = env_port.toUShort();
@@ -196,9 +206,9 @@ namespace pv
         // it is inert unless DSVIEW_PPS_AUTOSTART=1 is set in the environment.
         // DSVIEW_PPS_AUTOSTART_DELAY_MS tunes the start delay (default 2500 ms),
         // DSVIEW_PPS_AUTOSTOP_MS then stops the measurement after that delay.
-        if (qgetenv("DSVIEW_PPS_AUTOSTART") == "1") {
-            const int stop_after_ms = qgetenv("DSVIEW_PPS_AUTOSTOP_MS").toInt();
-            int start_delay_ms = qgetenv("DSVIEW_PPS_AUTOSTART_DELAY_MS").toInt();
+        if (test_env("DSVIEW_PPS_AUTOSTART") == "1") {
+            const int stop_after_ms = test_env("DSVIEW_PPS_AUTOSTOP_MS").toInt();
+            int start_delay_ms = test_env("DSVIEW_PPS_AUTOSTART_DELAY_MS").toInt();
             if (start_delay_ms <= 0)
                 start_delay_ms = 2500;
             QTimer::singleShot(start_delay_ms, this, [this]() {
@@ -209,7 +219,7 @@ namespace pv
                 // validation: DSVIEW_PPS_TESTCFG points at a JSON file with
                 // {ref_channel, ref_edge(0/1), sample_rate, capture_ms,
                 //  channels:[{ch, edge(0/1)}], disabled:[...]}.
-                const QByteArray cfg_path = qgetenv("DSVIEW_PPS_TESTCFG");
+                const QByteArray cfg_path = test_env("DSVIEW_PPS_TESTCFG");
                 if (!cfg_path.isEmpty() && _pps_manager) {
                     QFile f(QString::fromUtf8(cfg_path));
                     if (f.open(QIODevice::ReadOnly)) {
@@ -259,12 +269,12 @@ namespace pv
             // Automation hook: open the configuration dialog once and close it
             // again, so the logged rate/channel list can be checked head-less
             // (DSVIEW_PPS_OPENCFG=1).
-            if (qgetenv("DSVIEW_PPS_OPENCFG") == "1") {
+            if (test_env("DSVIEW_PPS_OPENCFG") == "1") {
                 QTimer::singleShot(start_delay_ms + stop_after_ms + 1000,
                     this, [this]() {
                     QTimer::singleShot(400, this, []() {
                         // A screenshot run closes the dialog itself, after the grab.
-                        if (!qgetenv("DSVIEW_PPS_CONFIG_SHOT").isEmpty())
+                        if (!test_env("DSVIEW_PPS_CONFIG_SHOT").isEmpty())
                             return;
                         const QWidgetList tops =
                             QApplication::topLevelWidgets();
@@ -280,13 +290,13 @@ namespace pv
 
         // Automation hook: open the waveform window on startup
         // (DSVIEW_PPS_WAVE=1), so its rendering can be captured head-less.
-        if (qgetenv("DSVIEW_PPS_WAVE") == "1") {
+        if (test_env("DSVIEW_PPS_WAVE") == "1") {
             QTimer::singleShot(2000, this, [this]() { on_pps_wave(); });
         }
 
         // Automation hook: run the calibration dialog on startup
         // (DSVIEW_PPS_CALIB_AUTO=1), optionally grabbing it to a png.
-        if (qgetenv("DSVIEW_PPS_CALIB_AUTO") == "1") {
+        if (test_env("DSVIEW_PPS_CALIB_AUTO") == "1") {
             QTimer::singleShot(3000, this, [this]() { on_pps_calib(); });
         }
 
@@ -294,9 +304,9 @@ namespace pv
         // grabs the whole window with the dock shown, then clicks the toolbar's
         // PPS button (the real signal path) to hide and show it again, saving
         // <png>.hidden.png and <png>.shown.png so both states can be checked.
-        const QString dock_shot = QString::fromUtf8(qgetenv("DSVIEW_PPS_DOCK_SHOT"));
+        const QString dock_shot = QString::fromUtf8(test_env("DSVIEW_PPS_DOCK_SHOT"));
         if (!dock_shot.isEmpty()) {
-            int shot_ms = qgetenv("DSVIEW_PPS_DOCK_SHOT_MS").toInt();
+            int shot_ms = test_env("DSVIEW_PPS_DOCK_SHOT_MS").toInt();
             if (shot_ms <= 0)
                 shot_ms = 4000;
             QTimer::singleShot(shot_ms, this, [this, dock_shot]() {
@@ -325,7 +335,7 @@ namespace pv
                             grab().save(dock_shot + ".shown.png");
                             // Optional: exercise the dock's configure icon, so
                             // the icon -> dialog route is checked too.
-                            if (qgetenv("DSVIEW_PPS_DOCK_CLICK_CFG") == "1") {
+                            if (test_env("DSVIEW_PPS_DOCK_CLICK_CFG") == "1") {
                                 QToolButton *cfg_btn =
                                     findChild<QToolButton*>("ppsConfigButton");
                                 if (cfg_btn)
@@ -383,11 +393,57 @@ namespace pv
         _vertical_layout->addWidget(_view);
 
 
-        setIconSize(QSize(40, 40));
+        // 桌面端工具栏图标 38x38：40x40 在 100% 缩放屏幕上偏大，48x48 更大，
+        // 用户指定用 38；图标框大小决定按钮高度，文字行高不变。
+        setIconSize(QSize(38, 38));
+#if defined(Q_OS_ANDROID)
+        /* 手机屏宽只有 360~430dp，桌面版把采样/触发/文件/Logo 四条工具栏排在
+         * 一行，右侧会被裁掉。这里换成两行：第一行 Logo + 采样，第二行触发 + 文件。
+         * 第二行按钮多，改成纯图标 + 缩小图标，避免文字被省略成 "Op...ns"。 */
         addToolBar(_sampling_bar);
+        addToolBar(_logo_bar);
+        addToolBarBreak(Qt::TopToolBarArea);
+        setIconSize(QSize(34, 34));
+#endif
         addToolBar(_trig_bar);
         addToolBar(_file_bar);
+#if defined(Q_OS_ANDROID)
+        QToolBar *androidBars[2] = {_trig_bar, _file_bar};
+        for (QToolBar *bar : androidBars) {
+            for (QAction *a : bar->actions()) {
+                QWidget *w = bar->widgetForAction(a);
+                if (QToolButton *tb = qobject_cast<QToolButton *>(w))
+                    tb->setToolButtonStyle(Qt::ToolButtonIconOnly);
+            }
+        }
+#else
         addToolBar(_logo_bar);
+
+        // 图标放到 38 后按钮默认宽度按图标算，文字（"模式(E)"、"选项(0)"）会被
+        // 折成两行；这里按文字实际宽度给每个按钮一个最小宽度，保持单行。
+        QToolBar *desktopBars[] = {_sampling_bar, _trig_bar, _file_bar, _logo_bar};
+        for (QToolBar *bar : desktopBars) {
+            // 注意：采样栏把按钮放在内部布局里再整体 addWidget，这些按钮不在
+            // bar->actions() 中，必须用 findChildren 向下遍历才能全部取到。
+            for (QToolButton *tb : bar->findChildren<QToolButton *>()) {
+                if (tb == nullptr)
+                    continue;
+                // QToolBar::addWidget() 添加的按钮（模式/开始/立即/选项/设备类型）
+                // 不会继承工具栏的 iconSize，仍用样式默认的 24x24，这里统一显式设置，
+                // 否则图标放大后只有走 addAction 的按钮变大。
+                tb->setIconSize(QSize(38, 38));
+
+                // 兜底：样表里只有 QMainWindow 级别的 icon-size，采样栏这类
+                // 通过 addWidget 挂按钮的工具栏不会自动继承，这里直接把工具栏
+                // 自己的 iconSize 也写死，保证按钮取图标尺寸时有一致的来源。
+                bar->setIconSize(QSize(38, 38));
+                if (tb->text().isEmpty())
+                    continue;
+                const int text_w = tb->fontMetrics().boundingRect(tb->text()).width() + 14;
+                tb->setMinimumWidth(qMax(tb->sizeHint().width(), text_w));
+            }
+        }
+#endif
 
         // Setup the dockWidget
         _protocol_dock = new QDockWidget(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_PROTOCOL_DOCK_TITLE), "Decode Protocol"), this);
@@ -420,11 +476,80 @@ namespace pv
         _search_widget = new dock::SearchDock(_search_dock, *_view, _session);
         _search_dock->setWidget(_search_widget);
 
+        // decoder debug console dock
+        _decoder_console_dock = new QDockWidget(tr("解码调试控制台"), this);
+        _decoder_console_dock->setObjectName("decoder_console_dock");
+        _decoder_console_dock->setFeatures(QDockWidget::DockWidgetMovable |
+                                           QDockWidget::DockWidgetClosable);
+        _decoder_console_dock->setAllowedAreas(Qt::BottomDockWidgetArea |
+                                               Qt::RightDockWidgetArea);
+        _decoder_console_dock->setVisible(false);
+        _decoder_console_widget = new dock::DecoderConsoleDock(_decoder_console_dock, _session);
+        _decoder_console_dock->setWidget(_decoder_console_widget);
+        addDockWidget(Qt::BottomDockWidgetArea, _decoder_console_dock);
+
+        // Arm the script watcher right away: the checkbox starts checked, but
+        // the signal only fires when the user toggles it.
+        _decoder_console_widget->apply_initial_state();
+
+        connect(_protocol_widget, &dock::ProtocolDock::sig_show_console,
+                this, [this]() {
+            _decoder_console_dock->setVisible(true);
+            _decoder_console_dock->raise();
+        });
+
+        // The per-decoder run button exists only for the debug console workflow,
+        // so it follows the console dock's visibility.
+        connect(_decoder_console_dock, &QDockWidget::visibilityChanged,
+                this, [this](bool visible) {
+            if (_protocol_widget)
+                _protocol_widget->set_run_buttons_visible(visible);
+        });
+
+        // Test hook: DSVIEW_DECODE_CONSOLE=1 opens the console at startup.
+        if (!test_env("DSVIEW_DECODE_CONSOLE").isEmpty())
+            _decoder_console_dock->setVisible(true);
+
+        if (_protocol_widget)
+            _protocol_widget->set_run_buttons_visible(
+                    _decoder_console_dock->isVisible());
+
         addDockWidget(Qt::RightDockWidgetArea, _protocol_dock);
         addDockWidget(Qt::RightDockWidgetArea, _trigger_dock);
         addDockWidget(Qt::RightDockWidgetArea, _dso_trigger_dock);
         addDockWidget(Qt::RightDockWidgetArea, _measure_dock);
         addDockWidget(Qt::BottomDockWidgetArea, _search_dock);
+
+        // Test hook: DSVIEW_PROTOCOL_DOCK=1 opens the decoder dock at startup
+        // so the per-decoder buttons can be screenshotted without clicking.
+        if (!test_env("DSVIEW_PROTOCOL_DOCK").isEmpty())
+            _protocol_dock->setVisible(true);
+
+        // Test hook: DSVIEW_TEST_DECODER=<decoder id> adds one decoder row to
+        // the dock at startup, mirroring what the "+" button does. Only used to
+        // screenshot the per-row buttons, which otherwise need GUI clicks.
+        // Deferred: the decoder package list is only filled once the loader has
+        // scanned the decoders directory.
+        const QByteArray test_decoder = test_env("DSVIEW_TEST_DECODER");
+        if (!test_decoder.isEmpty() && _protocol_widget) {
+            // The decoder package list is filled asynchronously, so retry until
+            // the requested id resolves instead of assuming it is ready.
+            QTimer *test_timer = new QTimer(this);
+            int *test_tries = new int(0);
+            test_timer->setInterval(1000);
+            connect(test_timer, &QTimer::timeout, this,
+                    [this, test_decoder, test_timer, test_tries]() {
+                std::list<pv::data::decode::Decoder *> sub_decoders;
+                const bool added = _protocol_widget->add_protocol_by_id(
+                        QString::fromUtf8(test_decoder), true, sub_decoders);
+                if (added || ++(*test_tries) >= 10) {
+                    test_timer->stop();
+                    test_timer->deleteLater();
+                    delete test_tries;
+                }
+            });
+            test_timer->start();
+        }
 
         // event filter
         _view->installEventFilter(this);
@@ -694,7 +819,7 @@ namespace pv
 
     void MainWindow::on_protocol(bool visible)
     {
-        _protocol_dock->setVisible(visible);
+        show_side_dock(_protocol_dock, visible);
 
         if (!visible)
             _view->setFocus();
@@ -705,23 +830,59 @@ namespace pv
         if (_device_agent->get_work_mode() != DSO)
         {
             _trigger_widget->update_view();
-            _trigger_dock->setVisible(visible);
+            show_side_dock(_trigger_dock, visible);
             _dso_trigger_dock->setVisible(false);
         }
         else
         {
             _dso_trigger_widget->update_view();
             _trigger_dock->setVisible(false);
-            _dso_trigger_dock->setVisible(visible);
+            show_side_dock(_dso_trigger_dock, visible);
         }
 
         if (!visible)
             _view->setFocus();
     }
 
+    /* 手机上右侧面板按屏宽铺开：
+     * 桌面版这些面板只有 300~400dp，放在手机上会把内容切掉一半，
+     * 而且触摸拖动面板边框很难精准。面板展开时占满宽度，收起后波形区恢复。 */
+    void MainWindow::show_side_dock(QDockWidget *dock, bool visible)
+    {
+        if (!dock)
+            return;
+
+        dock->setVisible(visible);
+#if defined(Q_OS_ANDROID)
+        /* 手机上中央波形区会跟右侧面板抢宽度：QDockWidget 最多只能拿到
+         * ~276dp（受中央控件最小宽限制），面板里的 "Rising/Falling/Edge"
+         * 这类长标签就会被右边缘切掉。手机上没有足够宽度并排显示，所以
+         * 面板展开时把中央波形区收起，让面板独占屏宽；全部面板关闭后波形恢复。 */
+        bool anyPanel = (_protocol_dock && _protocol_dock->isVisible())
+            || (_trigger_dock && _trigger_dock->isVisible())
+            || (_dso_trigger_dock && _dso_trigger_dock->isVisible())
+            || (_measure_dock && _measure_dock->isVisible())
+            || (_pps_dock && _pps_dock->isVisible());
+        if (_central_widget)
+            _central_widget->setVisible(!anyPanel);
+
+        if (visible)
+        {
+            QPointer<QDockWidget> guard(dock);
+            QTimer::singleShot(0, this, [this, guard]() {
+                if (!guard)
+                    return;
+                resizeDocks({guard.data()}, {qMax(240, width() - 4)}, Qt::Horizontal);
+            });
+        }
+#else
+        Q_UNUSED(visible);
+#endif
+    }
+
     void MainWindow::on_measure(bool visible)
     {
-        _measure_dock->setVisible(visible);
+        show_side_dock(_measure_dock, visible);
 
         if (!visible)
             _view->setFocus();
@@ -779,7 +940,7 @@ namespace pv
         // Head-less check hook: DSVIEW_PPS_CONFIG_SHOT=<png> grabs the dialog
         // once it has been laid out, so the layout can be inspected without a
         // person clicking through the menus.
-        const QString cfg_shot = QString::fromUtf8(qgetenv("DSVIEW_PPS_CONFIG_SHOT"));
+        const QString cfg_shot = QString::fromUtf8(test_env("DSVIEW_PPS_CONFIG_SHOT"));
         if (!cfg_shot.isEmpty()) {
             QTimer::singleShot(1500, &dlg, [&dlg, cfg_shot]() {
                 dlg.grab().save(cfg_shot);
@@ -790,6 +951,7 @@ namespace pv
             // set_config() stores the whole setup in QSettings, so the dialog
             // opens with the same values after a restart.
             _pps_manager->set_config(dlg.result_config());
+            save_channels_before_pps();
             apply_pps_channels_to_session();
         }
     }
@@ -821,10 +983,53 @@ namespace pv
             _view->signals_changed(NULL);
     }
 
+    void MainWindow::save_channels_before_pps()
+    {
+        if (_pps_channels_saved || !_session || !_session->get_device())
+            return;
+
+        _pps_saved_channels.clear();
+        for (GSList *l = _session->get_device()->get_channels(); l; l = l->next) {
+            sr_channel *c = static_cast<sr_channel *>(l->data);
+            if (c->type != SR_CHANNEL_LOGIC || c->index < 0)
+                continue;
+            if ((int)_pps_saved_channels.size() <= c->index)
+                _pps_saved_channels.resize(c->index + 1, 0);
+            _pps_saved_channels[c->index] = c->enabled ? 1 : 0;
+        }
+        _pps_channels_saved = true;
+        dsv_info("1PPS: main capture channel state saved (%d channel(s))",
+            (int)_pps_saved_channels.size());
+    }
+
+    void MainWindow::restore_channels_after_pps()
+    {
+        if (!_pps_channels_saved || !_session || !_session->get_device())
+            return;
+
+        DeviceAgent *dev = _session->get_device();
+        int enabled = 0;
+        for (GSList *l = dev->get_channels(); l; l = l->next) {
+            sr_channel *c = static_cast<sr_channel *>(l->data);
+            if (c->type != SR_CHANNEL_LOGIC || c->index < 0)
+                continue;
+            if ((size_t)c->index >= _pps_saved_channels.size())
+                continue;
+            const bool on = _pps_saved_channels[c->index] != 0;
+            dev->enable_probe(c, on);
+            if (on)
+                enabled++;
+        }
+        _pps_channels_saved = false;
+        dsv_info("1PPS: main capture channels restored (%d enabled)", enabled);
+        if (_view)
+            _view->signals_changed(NULL);
+    }
+
     void MainWindow::on_pps_start()
     {
         ensure_pps();
-        _pps_dock->setVisible(true);
+        show_side_dock(_pps_dock, true);
         _trig_bar->set_pps_result_checked(true);
 
         if (_pps_manager->is_running()) {
@@ -836,10 +1041,15 @@ namespace pv
         // Mirror the configured 1PPS channels onto the main capture view before
         // the device is taken over, so what the user measures in the PPS panel is
         // what the main waveform is set up for.
+        save_channels_before_pps();
         apply_pps_channels_to_session();
 
         // Start directly: missing options are derived from the active device.
         if (!_pps_manager->start()) {
+            // The mirror above already replaced the user's channel selection;
+            // a failed start has no stop() to undo it, so hand the channels back
+            // here (pps_start() does the same for the MCP entry point).
+            restore_channels_after_pps();
             statusBar()->show();
             QMessageBox::warning(this, QString::fromUtf8("1PPS 测量"),
                     _pps_manager->start_error());
@@ -854,6 +1064,7 @@ namespace pv
     {
         if (_pps_manager)
             _pps_manager->stop();
+        restore_channels_after_pps();
         if (_pps_result)
             _pps_result->refresh();
     }
@@ -861,7 +1072,7 @@ namespace pv
     void MainWindow::on_pps_result(bool visible)
     {
         ensure_pps();
-        _pps_dock->setVisible(visible);
+        show_side_dock(_pps_dock, visible);
         _trig_bar->set_pps_result_checked(visible);
     }
 
@@ -887,8 +1098,8 @@ namespace pv
         pps::query_device_caps(_session, caps);
         const int max_ch = caps.channel_num > 0 ? caps.channel_num - 1 : 7;
         int def_ch = _pps_manager->config().ref_channel;
-        const int ch_override = qgetenv("DSVIEW_PPS_CALIB_CH").toInt();
-        if (ch_override > 0 || qgetenv("DSVIEW_PPS_CALIB_CH") == "0")
+        const int ch_override = test_env("DSVIEW_PPS_CALIB_CH").toInt();
+        if (ch_override > 0 || test_env("DSVIEW_PPS_CALIB_CH") == "0")
             def_ch = ch_override;
         if (def_ch < 0 || def_ch > max_ch)
             def_ch = 0;
@@ -896,19 +1107,26 @@ namespace pv
         dialogs::PpsCalibDlg dlg(_session, def_ch, max_ch, this);
         // Head-less check hook: DSVIEW_PPS_CALIB_SHOT=<png> starts the run by
         // itself and grabs the dialog before closing it.
-        const QString calib_shot = QString::fromUtf8(qgetenv("DSVIEW_PPS_CALIB_SHOT"));
+        const QString calib_shot = QString::fromUtf8(test_env("DSVIEW_PPS_CALIB_SHOT"));
         if (!calib_shot.isEmpty()) {
             QTimer::singleShot(600, &dlg, [&dlg]() {
                 QMetaObject::invokeMethod(&dlg, "on_start");
             });
-            const int shot_ms = qgetenv("DSVIEW_PPS_CALIB_SHOT_MS").toInt();
+            const int shot_ms = test_env("DSVIEW_PPS_CALIB_SHOT_MS").toInt();
             QTimer::singleShot(shot_ms > 0 ? shot_ms : 45000, &dlg,
                 [&dlg, calib_shot]() {
                 dlg.grab().save(calib_shot);
                 dlg.accept();
             });
         }
+        // Calibration rewrites the probe enables as well; the user's own channel
+        // selection has to survive it. The restore is deferred by one event loop
+        // turn because the dialog stops its run in its destructor, which only
+        // happens once this function returns - restoring earlier would hand the
+        // channels back while the calibration is still sampling.
+        save_channels_before_pps();
         dlg.exec();
+        QTimer::singleShot(0, this, [this]() { restore_channels_after_pps(); });
 
         if (dlg.has_result()) {
             const double f = dlg.factor();
@@ -967,7 +1185,10 @@ namespace pv
         o["sample_rate"] = static_cast<double>(cfg.sample_rate);
         o["save_dir"] = cfg.save_dir;
         o["range"] = cfg.mode_channels;
-        o["auto_save_loss"] = cfg.auto_save_loss;
+        o["auto_save_loss"] = cfg.dsl_save_loss;   // kept for older callers
+        o["dsl_save_loss"] = cfg.dsl_save_loss;
+        o["dsl_save_abnormal"] = cfg.dsl_save_abnormal;
+        o["dsl_save_always"] = cfg.dsl_save_always;
         o["calib_factor"] = cfg.calib_factor;
         o["channels"] = channels;
         o["disabled"] = disabled;
@@ -991,8 +1212,14 @@ namespace pv
             cfg.save_dir = o.value("save_dir").toString();
         if (o.contains("range"))
             cfg.mode_channels = o.value("range").toInt();
-        if (o.contains("auto_save_loss"))
-            cfg.auto_save_loss = o.value("auto_save_loss").toBool();
+        if (o.contains("dsl_save_loss"))
+            cfg.dsl_save_loss = o.value("dsl_save_loss").toBool();
+        else if (o.contains("auto_save_loss"))
+            cfg.dsl_save_loss = o.value("auto_save_loss").toBool();
+        if (o.contains("dsl_save_abnormal"))
+            cfg.dsl_save_abnormal = o.value("dsl_save_abnormal").toBool();
+        if (o.contains("dsl_save_always"))
+            cfg.dsl_save_always = o.value("dsl_save_always").toBool();
         if (o.contains("calib_factor")) {
             const double f = o.value("calib_factor").toDouble(1.0);
             if (f > 0.0)
@@ -1006,7 +1233,7 @@ namespace pv
                 ch.channel_index = c.value("ch").toInt();
                 ch.edge = c.value("edge").toInt(cfg.ref_edge);
                 ch.enabled = true;
-                ch.save_on_loss = c.value("save").toBool(cfg.auto_save_loss);
+                ch.save_on_loss = c.value("save").toBool(cfg.dsl_save_loss);
                 cfg.channels.push_back(ch);
             }
         }
@@ -1084,7 +1311,7 @@ namespace pv
     bool MainWindow::pps_start(QString &error)
     {
         ensure_pps();
-        _pps_dock->setVisible(true);
+        show_side_dock(_pps_dock, true);
         _trig_bar->set_pps_result_checked(true);
 
         if (_pps_manager->is_running()) {
@@ -1094,7 +1321,9 @@ namespace pv
 
         // Unlike on_pps_start() this never opens a modal box: an MCP client
         // gets the failure text instead of a dialog it cannot dismiss.
+        save_channels_before_pps();
         if (!_pps_manager->start()) {
+            restore_channels_after_pps();
             error = _pps_manager->start_error();
             if (error.isEmpty())
                 error = QString::fromUtf8("1PPS 启动失败。");
@@ -1110,6 +1339,7 @@ namespace pv
     {
         if (_pps_manager)
             _pps_manager->stop();
+        restore_channels_after_pps();
         if (_pps_result)
             _pps_result->refresh();
     }
@@ -1161,6 +1391,12 @@ namespace pv
         out["last_dsl_path"] = _pps_manager->last_dsl_path();
 
         return out;
+    }
+
+    QString MainWindow::console_text() const
+    {
+        return _decoder_console_widget
+                ? _decoder_console_widget->text() : QString();
     }
 
     void MainWindow::on_search(bool visible)
@@ -1851,6 +2087,11 @@ namespace pv
         // default dockwidget size
         AppConfig &app = AppConfig::Instance();
         QByteArray st = app.frameOptions.windowState;
+#if defined(Q_OS_ANDROID)
+        /* 桌面版保存的 dock 布局（含面板宽度、浮动位置）在手机上会把面板
+         * 挤成窄条或推到屏幕外，手机上直接用默认布局。 */
+        st.clear();
+#endif
         if (!st.isEmpty())
         {
             try
@@ -2081,8 +2322,14 @@ namespace pv
         QString qssRes = ":/" + style + ".qss";
         QFile qss(qssRes);
         qss.open(QFile::ReadOnly | QFile::Text);
-        qApp->setStyleSheet(qss.readAll());
+        QString qssText = qss.readAll();
         qss.close();
+#if defined(Q_OS_ANDROID)
+        /* 手机触屏：桌面版 QSS 的按钮/下拉框只有 22~30px 高，点不中。
+         * 这里追加一层覆盖，把可点区域抬到 40~44dp、字号放大。 */
+        qssText += android_qss_overlay();
+#endif
+        qApp->setStyleSheet(qssText);
 
         UiManager::Instance()->Update(UI_UPDATE_ACTION_THEME);
         UiManager::Instance()->Update(UI_UPDATE_ACTION_FONT);
@@ -2516,6 +2763,17 @@ namespace pv
                 }
                 _view->hide_calibration();
 
+                // The protocol rows belong to the device that is going away and
+                // are torn down here. Keep their settings first: a data file that
+                // carries no decoder section (autosave frames, raw exports) can
+                // then re-create the same rows instead of opening with nothing to
+                // decode.
+                _last_decoder_json = QJsonArray();
+                {
+                    StoreSession ss(_session);
+                    ss.gen_decoders_json(_last_decoder_json);
+                }
+
                 _protocol_widget->del_all_protocol();
                 _view->reload();
                 break;
@@ -2555,10 +2813,24 @@ namespace pv
                     {                    
                         QJsonArray deArray = get_decoder_json_from_data_file(_device_agent->path(), bLoadSuccess);
 
-                        if (bLoadSuccess){
+                        if (bLoadSuccess && !deArray.isEmpty()){
                             StoreSession ss(_session);
                             ss.load_decoders(_protocol_widget, deArray);
-                        }                    
+                            bDoneDecoder = !_session->get_decode_signals().empty();
+                        }
+
+                        // Files written by the autosave manager and raw exports
+                        // hold samples only - no decoder section. Opening such a
+                        // file used to leave the protocol rows empty, which reads
+                        // as "file opened but nothing decoded". Fall back to the
+                        // decoders that were on screen before the switch; the
+                        // capture started below then decodes the file with them.
+                        if (!bDoneDecoder && !_last_decoder_json.isEmpty()){
+                            dsv_info("File has no decoder section, restoring %d decoder(s) from the session.",
+                                    _last_decoder_json.size());
+                            StoreSession ss(_session);
+                            ss.load_decoders(_protocol_widget, _last_decoder_json);
+                        }
                     }
 
                     _view->update_all_trace_postion();                

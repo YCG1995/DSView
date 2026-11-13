@@ -74,6 +74,7 @@ public:
 protected:
     void accept();
     void reject();
+    void showEvent(QShowEvent *event) override;
 
 private:
     void build_base(bool hasClose); 
