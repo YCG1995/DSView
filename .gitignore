@@ -61,3 +61,12 @@ qtpro5
 win32x
 qrc_*
 install_manifest.txt
+
+# 构建必需的头文件：上面的 config.h / version.h / config.h.in 规则是给 autotools 生成物准备的，
+# 这几个是源码，必须入库，否则新克隆（或 push_to_github.ps1 切分支之后）无法配置/编译
+!DSView/config.h.in
+!libsigrok4DSL/config.h
+!libsigrok4DSL/version.h
+!libsigrokdecode4DSL/config.h
+!libsigrokdecode4DSL/version.h
+!DSView/config.h

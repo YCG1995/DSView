@@ -37,3 +37,7 @@ stamp-h?
 /tests/*.log
 /tests/*.trs
 /tests/main
+
+# config.h and version.h are sources in this tree (not autotools output)
+!/config.h
+!/version.h
