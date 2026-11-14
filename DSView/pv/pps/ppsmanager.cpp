@@ -18,6 +18,7 @@
 #include <cmath>
 #include <memory>
 #include <algorithm>
+#include <chrono>
 #include <thread>
 #include <QCoreApplication>
 #include <QDateTime>
@@ -166,11 +167,12 @@ static void collect_rates_of_mode(DeviceAgent *dev, vector<uint64_t> &out)
 	g_variant_unref(dict);
 }
 
-static void collect_modes(DeviceAgent *dev, PpsDeviceCaps &caps)
+static void collect_modes(DeviceAgent *dev, PpsDeviceCaps &caps, bool probe)
 {
 	caps.modes.clear();
 
-	GVariant *gvar = dev->get_config_list(nullptr, SR_CONF_CHANNEL_MODE);
+	GVariant *gvar = probe
+		? dev->get_config_list(nullptr, SR_CONF_CHANNEL_MODE) : nullptr;
 	if (gvar != nullptr) {
 		sr_list_item *plist =
 			reinterpret_cast<sr_list_item *>(g_variant_get_uint64(gvar));
@@ -252,6 +254,66 @@ static void collect_modes(DeviceAgent *dev, PpsDeviceCaps &caps)
 		caps.max_rate = caps.modes.front().max_rate;
 }
 
+void PpsDeviceState::capture(DeviceAgent *dev)
+{
+	*this = PpsDeviceState();
+	if (dev == nullptr)
+		return;
+
+	int v = 0;
+	op_mode = dev->get_config_int16(SR_CONF_OPERATION_MODE, v) ? v : -1;
+	ch_mode = dev->get_config_int16(SR_CONF_CHANNEL_MODE, v) ? v : -1;
+	uint64_t rate = 0;
+	sample_rate = dev->get_config_uint64(SR_CONF_SAMPLERATE, rate) ? rate : 0;
+	for (GSList *l = dev->get_channels(); l != nullptr; l = l->next) {
+		sr_channel *c = static_cast<sr_channel *>(l->data);
+		if (c->type != SR_CHANNEL_LOGIC)
+			continue;
+		probes.push_back(std::make_pair(static_cast<int>(c->index),
+			c->enabled != 0));
+	}
+	valid = true;
+}
+
+void PpsDeviceState::restore(DeviceAgent *dev, bool with_rate) const
+{
+	if (!valid || dev == nullptr)
+		return;
+
+	int cur = -1;
+	if (op_mode >= 0 && dev->get_config_int16(SR_CONF_OPERATION_MODE, cur) &&
+			cur != op_mode)
+		dev->set_config_int16(SR_CONF_OPERATION_MODE, op_mode);
+	cur = -1;
+	if (ch_mode >= 0 && dev->get_config_int16(SR_CONF_CHANNEL_MODE, cur) &&
+			cur != ch_mode)
+		dev->set_config_int16(SR_CONF_CHANNEL_MODE, ch_mode);
+	if (with_rate && sample_rate != 0)
+		dev->set_config_uint64(SR_CONF_SAMPLERATE, sample_rate);
+
+	// Walk the list the device has now: the mode change may have rebuilt it,
+	// so a saved index that no longer exists is simply skipped.
+	for (GSList *l = dev->get_channels(); l != nullptr; l = l->next) {
+		sr_channel *c = static_cast<sr_channel *>(l->data);
+		if (c->type != SR_CHANNEL_LOGIC)
+			continue;
+		bool want = c->enabled;
+		for (size_t i = 0; i < probes.size(); ++i) {
+			if (probes[i].first == c->index) {
+				// A channel the user had (and still has) keeps its old flag;
+				// one the restored mode adds keeps whatever it defaults to.
+				want = probes[i].second;
+				break;
+			}
+		}
+		dev->enable_probe(c->index, want);
+	}
+}
+
+// Result of the last full query, handed out while a capture is running.
+static PpsDeviceCaps s_cached_caps;
+static QString s_cached_dev;
+
 bool query_device_caps(SigSession *session, PpsDeviceCaps &caps)
 {
 	caps = PpsDeviceCaps();
@@ -261,12 +323,24 @@ bool query_device_caps(SigSession *session, PpsDeviceCaps &caps)
 	if (dev == nullptr)
 		return false;
 
+	// Probing switches the operation and channel mode, which rebuilds the
+	// probe list - not something to do under a running capture.
+	const bool busy = session->is_working();
+	if (busy && s_cached_caps.channel_num > 0 && s_cached_dev == dev->name()) {
+		caps = s_cached_caps;
+		return true;
+	}
+
+	PpsDeviceState saved;
+	if (!busy)
+		saved.capture(dev);
+
 	// Every measurement runs in buffer mode, and the driver only lists the
 	// channel modes of the operation mode it is currently in: in stream mode the
 	// widest 16-channel mode tops out at 20MHz, which would make the buffer
 	// rates look unavailable. Ask the device what it can do in the mode we use.
 	int op_mode = LO_OP_STREAM;
-	if (dev->get_config_int16(SR_CONF_OPERATION_MODE, op_mode) &&
+	if (!busy && dev->get_config_int16(SR_CONF_OPERATION_MODE, op_mode) &&
 	    op_mode != LO_OP_BUFFER)
 		dev->set_config_int16(SR_CONF_OPERATION_MODE, LO_OP_BUFFER);
 
@@ -286,10 +360,18 @@ bool query_device_caps(SigSession *session, PpsDeviceCaps &caps)
 		caps.max_rate = max_rate;
 
 	collect_rates(dev, caps);
-	collect_modes(dev, caps);
+	collect_modes(dev, caps, !busy);
 
 	if (caps.max_rate == 0 && !caps.rates.empty())
 		caps.max_rate = caps.rates.back();
+
+	if (!busy) {
+		saved.restore(dev, true);
+		if (caps.channel_num > 0) {
+			s_cached_caps = caps;
+			s_cached_dev = dev->name();
+		}
+	}
 
 	return caps.channel_num > 0;
 }
@@ -318,16 +400,51 @@ PpsManager::PpsManager(SigSession *session, QObject *parent)
 	load_config();
 }
 
-void PpsManager::set_config(const PpsConfig &cfg)
+bool PpsManager::set_config(const PpsConfig &cfg)
 {
+	// The statistics, the CSV header and the probes the hardware streams all
+	// follow the configuration the run was started with.
+	if (_running) {
+		dsv_err("1PPS config: change refused, a measurement is running");
+		return false;
+	}
 	_config = cfg;
+	sanitize_config();
 	reset_statistics();
 	save_config();
+	return true;
+}
+
+void PpsManager::sanitize_config()
+{
+	if (_config.ref_channel < 0)
+		_config.ref_channel = 0;
+	if (_config.ref_edge != PPS_EDGE_FALLING)
+		_config.ref_edge = PPS_EDGE_RISING;
+	_config.trigger_pos_percent =
+		std::min(100, std::max(0, _config.trigger_pos_percent));
+	if (!std::isfinite(_config.capture_time_ms) || _config.capture_time_ms <= 0.0)
+		_config.capture_time_ms = 10.0;
+	if (!std::isfinite(_config.calib_factor) || _config.calib_factor <= 0.0)
+		_config.calib_factor = 1.0;
+	if (_config.mode_channels < 0)
+		_config.mode_channels = 0;
+
+	std::vector<PpsChannel> kept;
+	for (size_t i = 0; i < _config.channels.size(); ++i) {
+		PpsChannel ch = _config.channels[i];
+		if (ch.channel_index < 0)
+			continue;
+		if (ch.edge != PPS_EDGE_FALLING)
+			ch.edge = PPS_EDGE_RISING;
+		kept.push_back(ch);
+	}
+	_config.channels.swap(kept);
 }
 
 void PpsManager::set_calib_factor(double f)
 {
-	if (f > 0.0) {
+	if (std::isfinite(f) && f > 0.0) {
 		_config.calib_factor = f;
 		save_config();
 	}
@@ -395,6 +512,7 @@ void PpsManager::load_config()
 	}
 
 	_config = cfg;
+	sanitize_config();
 	// The statistics arrays are sized from the channel list, so a restored
 	// config has to size them too - otherwise the result dock reads past the
 	// end of an empty array the moment it is built, before any capture ran.
@@ -514,20 +632,6 @@ QString PpsManager::dsl_dir() const
 	return QDir(_config.save_dir).filePath(base);
 }
 
-bool PpsManager::save_loss_frame(const std::vector<PpsResult> &results)
-{
-	QStringList lost;
-	for (size_t i = 0; i < results.size() && i < _config.channels.size(); ++i) {
-		if (!results[i].valid && _config.channels[i].save_on_loss)
-			lost << QString("CH%1").arg(results[i].channel_index);
-	}
-	if (lost.isEmpty())
-		return false;
-
-	return save_frame_file("LOSS",
-		QStringList(QString::fromUtf8("数据丢失（%1）").arg(lost.join(","))));
-}
-
 bool PpsManager::save_frame_file(const QString &tag, const QStringList &reasons)
 {
 	if (_data_getter == nullptr) {
@@ -555,6 +659,10 @@ bool PpsManager::save_frame_file(const QString &tag, const QStringList &reasons)
 	// The store lives in a shared_ptr and the nested loop has a hard timeout:
 	// a stuck write (slow disk, a network share, a locked file) used to block
 	// the capture loop and the UI indefinitely.
+	auto t_begin = std::chrono::steady_clock::now();
+
+	// meta/decoders/session generation and the zip file creation run on this
+	// (caller) thread inside save_start(); only the chunk writing is threaded.
 	auto store = std::make_shared<StoreSession>(_session);
 	store->set_file_name(path);
 	store->_sessionDataGetter = _data_getter;
@@ -563,6 +671,8 @@ bool PpsManager::save_frame_file(const QString &tag, const QStringList &reasons)
 			path.toLocal8Bit().constData(), store->error().toLocal8Bit().constData());
 		return false;
 	}
+	const qint64 setup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - t_begin).count();
 
 	struct SaveCtx {
 		QEventLoop loop;
@@ -571,20 +681,32 @@ bool PpsManager::save_frame_file(const QString &tag, const QStringList &reasons)
 	};
 	auto ctx = std::make_shared<SaveCtx>();
 
-	std::thread waiter([store, ctx]() {
+	std::thread waiter([store, ctx]() mutable {
 		store->wait();
 		ctx->err = store->error();
 		QMetaObject::invokeMethod(&ctx->loop, "quit", Qt::QueuedConnection);
+		// Both objects are QObjects of the GUI thread. After a timeout this
+		// thread holds the last references, so hand them back instead of
+		// destroying them here.
+		QMetaObject::invokeMethod(qApp,
+			[s = std::move(store), c = std::move(ctx)]() {},
+			Qt::QueuedConnection);
 	});
 
+	// A member-less timer on the stack: it dies with this call, so a save that
+	// finished in time does not keep its store alive for the whole timeout.
 	const int kSaveTimeoutMs = 15000;
-	QTimer::singleShot(kSaveTimeoutMs, &ctx->loop, [ctx, store]() {
+	QTimer timeout;
+	timeout.setSingleShot(true);
+	connect(&timeout, &QTimer::timeout, &ctx->loop, [&ctx, &store]() {
 		ctx->timed_out = true;
 		store->cancel();
 		ctx->loop.quit();
 	});
+	timeout.start(kSaveTimeoutMs);
 
 	ctx->loop.exec();
+	timeout.stop();
 
 	if (ctx->timed_out) {
 		// The worker still owns the store and may be writing; detach instead of
@@ -605,9 +727,13 @@ bool PpsManager::save_frame_file(const QString &tag, const QStringList &reasons)
 	}
 
 	_last_dsl_path = path;
-	dsv_info("1PPS dsl: frame %d saved to %s (%s)", _frame_count,
+	const qint64 total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - t_begin).count();
+	dsv_info("1PPS dsl: frame %d saved to %s (%s) in %lld ms (setup %lld ms, write %lld ms)",
+		_frame_count,
 		path.toLocal8Bit().constData(),
-		reasons.join("; ").toLocal8Bit().constData());
+		reasons.join("; ").toLocal8Bit().constData(),
+		(long long)total_ms, (long long)setup_ms, (long long)(total_ms - setup_ms));
 	emit status_message(QString::fromUtf8("1PPS 已保存 DSL：%1（%2）")
 		.arg(QFileInfo(path).fileName()).arg(reasons.join("，")));
 	return true;
@@ -617,6 +743,8 @@ bool PpsManager::prepare_config()
 {
 	if (query_device_caps(_session, _caps) == false || _caps.channel_num <= 0)
 		return false;
+
+	sanitize_config();
 
 	if (_config.ref_channel < 0 || _config.ref_channel >= _caps.channel_num)
 		_config.ref_channel = 0;
@@ -763,20 +891,8 @@ bool PpsManager::apply_hardware_config()
 	// Remember the probe flags before anything here touches the mode: switching
 	// the channel mode rebuilds the probe list with defaults, so a snapshot taken
 	// later would not describe the user's setup.
-	if (!_probe_backup_valid) {
-		_probe_backup.clear();
-		GSList *chs = dev->get_channels();
-		for (GSList *l = chs; l != nullptr; l = l->next) {
-			sr_channel *c = static_cast<sr_channel *>(l->data);
-			if (c->type != SR_CHANNEL_LOGIC)
-				continue;
-			_probe_backup.push_back(std::make_pair(c->index, c->enabled));
-		}
-		int v = 0;
-		_op_mode_backup = dev->get_config_int16(SR_CONF_OPERATION_MODE, v) ? v : LO_OP_STREAM;
-		_ch_mode_backup = dev->get_config_int16(SR_CONF_CHANNEL_MODE, v) ? v : -1;
-		_probe_backup_valid = true;
-	}
+	if (!_dev_backup.valid)
+		_dev_backup.capture(dev);
 
 	// Single capture, buffer (not stream) operation.
 	// The driver switches buffer/stream through SR_CONF_OPERATION_MODE;
@@ -916,60 +1032,50 @@ bool PpsManager::apply_hardware_config()
 
 void PpsManager::restore_probe_state()
 {
-	if (!_probe_backup_valid)
+	if (!_dev_backup.valid)
 		return;
 
 	DeviceAgent *dev = (_session != nullptr) ? _session->get_device() : nullptr;
-	if (dev) {
-		// Put the channel mode and the probe flags back. The mode matters: a run
-		// may drop from 16 to 8 channels, and leaving that in place would hide
-		// CH8-CH15 in the main window for the rest of the session. The samplerate
-		// is deliberately not touched - the session tracks it, and the main
-		// window's own configuration re-applies it on the next capture.
-		if (_op_mode_backup != 0)
-			dev->set_config_int16(SR_CONF_OPERATION_MODE, _op_mode_backup);
-		int cur_mode_id = -1;
-		dev->get_config_int16(SR_CONF_CHANNEL_MODE, cur_mode_id);
-		if (_ch_mode_backup >= 0 && _ch_mode_backup != cur_mode_id)
-			dev->set_config_int16(SR_CONF_CHANNEL_MODE, _ch_mode_backup);
 
-		// Walk the list the device has now: the mode change may have rebuilt it,
-		// so a saved index that no longer exists is simply skipped.
-		GSList *chs = dev->get_channels();
-		for (GSList *l = chs; l != nullptr; l = l->next) {
-			sr_channel *c = static_cast<sr_channel *>(l->data);
-			if (c->type != SR_CHANNEL_LOGIC)
-				continue;
-			bool want = c->enabled;
-			for (size_t i = 0; i < _probe_backup.size(); ++i) {
-				if (_probe_backup[i].first == c->index) {
-					// A channel the user had (and still has) keeps its old flag;
-					// one the restored mode adds keeps whatever it defaults to.
-					want = _probe_backup[i].second;
-					break;
-				}
-			}
-			dev->enable_probe(c->index, want);
-		}
-		// Rows have to describe the restored probe list again, otherwise the
-		// channels the run switched off would stay hidden after it ends. reload()
-		// refuses to run while a capture is still unwinding, so give the session a
-		// moment before rebuilding the rows.
-		_mode_switched = false;
-		if (_session->is_working())
-			QTimer::singleShot(300, this, [this]() {
-				_session->reload_signals();
-			});
-		else
-			_session->reload_signals();
+	// stop_capture() may return while the driver is still uploading the frame.
+	// Switching the channel mode under it would rebuild the probe list of a
+	// live capture, and reload() refuses to run then, so wait for the session
+	// to go idle. A run started in the meantime keeps the backup and puts it
+	// back when it stops.
+	const int kMaxRetries = 50;
+	if (dev && _session->is_working() && _restore_retries < kMaxRetries) {
+		_restore_retries++;
+		QTimer::singleShot(200, this, [this]() {
+			if (!_running)
+				restore_probe_state();
+		});
+		return;
 	}
-	_probe_backup.clear();
-	_probe_backup_valid = false;
+	if (_restore_retries >= kMaxRetries)
+		dsv_err("1PPS: session still busy after %d ms, restoring anyway",
+			kMaxRetries * 200);
+	_restore_retries = 0;
+
+	if (dev) {
+		// Put the operation mode, the channel mode and the probe flags back.
+		// The mode matters: a run may drop from 16 to 8 channels, and leaving
+		// that in place would hide CH8-CH15 in the main window for the rest of
+		// the session. The samplerate is deliberately not touched - the session
+		// tracks it, and the main window's own configuration re-applies it on
+		// the next capture.
+		_dev_backup.restore(dev, false);
+		// Rows have to describe the restored probe list again, otherwise the
+		// channels the run switched off would stay hidden after it ends.
+		_mode_switched = false;
+		_session->reload_signals();
+	}
+	_dev_backup = PpsDeviceState();
 	// Report what the run was streaming; the enable flags themselves are read
 	// back by the channel list, so no count is invented here.
 	dsv_info("1PPS: probe setup restored (run streamed %d probe(s))",
 		_active_en_ch_num);
 	_active_en_ch_num = 0;
+	emit device_restored();
 }
 
 bool PpsManager::launch_capture()
@@ -993,6 +1099,14 @@ bool PpsManager::start()
 		return fail(QString::fromUtf8("未检测到可用设备，无法开始 1PPS 测量。"));
 	if (_session->get_device()->get_work_mode() != LOGIC)
 		return fail(QString::fromUtf8("当前设备不在逻辑分析仪模式，无法开始 1PPS 测量。"));
+	// Everything below reprograms the device; doing that under a capture that
+	// is still running would corrupt it and the start would fail anyway.
+	if (_session->is_working())
+		return fail(QString::fromUtf8("设备正在采集，请先停止当前采集再开始 1PPS 测量。"));
+	// The previous run's last frame is still being saved (nested event loop);
+	// it would re-arm the capture a second time once it returns.
+	if (_in_frame)
+		return fail(QString::fromUtf8("上一次测量的最后一帧还在保存，请稍后再开始。"));
 
 	// Build a usable default configuration when the user starts without
 	// opening the configuration dialog first.
@@ -1295,7 +1409,14 @@ void PpsManager::process_frame()
 			_session->set_generic_decode_blocked(false);
 		if (_watchdog)
 			_watchdog->stop();
+		ds_trigger_set_en(0);
+		// Not from inside the capture-end handler: let it unwind first.
+		QTimer::singleShot(100, this, [this]() {
+			if (!_running)
+				restore_probe_state();
+		});
 		emit status_message("PPS: re-trigger failed, stopping.");
+		emit frame_updated();
 	} else {
 		_frame_timer.start();
 		arm_watchdog();

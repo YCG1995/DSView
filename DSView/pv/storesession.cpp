@@ -545,8 +545,7 @@ void StoreSession::save_proc(data::Snapshot *snapshot)
  
     dsv_info("save task end.");
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    _is_busy = false;   
+    _is_busy = false;
 }
 
 bool StoreSession::meta_gen(data::Snapshot *snapshot, std::string &str)
