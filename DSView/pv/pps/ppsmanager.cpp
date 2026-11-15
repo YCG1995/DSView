@@ -2,6 +2,7 @@
  * 1PPS measurement state machine implementation.
  */
 #include "ppsmanager.h"
+#include "ppscalibration.h"
 #include "ppstesthooks.h"
 #include "ppsdecoder.h"
 #include "ppswriter.h"
@@ -40,6 +41,26 @@ using std::vector;
 namespace pv {
 namespace pps {
 
+// How many 1PPS measurements currently own the device. Process wide on purpose:
+// the calibration run has to see it, and it only knows the session, not the
+// manager instance.
+static int s_running_count = 0;
+
+bool PpsManager::any_running()
+{
+	return s_running_count > 0;
+}
+
+void PpsManager::set_running(bool running)
+{
+	if (_running == running)
+		return;
+	_running = running;
+	s_running_count += running ? 1 : -1;
+	if (s_running_count < 0)
+		s_running_count = 0;
+}
+
 PpsConfig::PpsConfig()
 	: ref_channel(0)
 	, ref_edge(PPS_EDGE_RISING)
@@ -59,6 +80,7 @@ PpsDeviceCaps::PpsDeviceCaps()
 	: channel_num(0)
 	, max_rate(0)
 	, hw_depth(0)
+	, hw_depth_total(0)
 {
 }
 
@@ -91,18 +113,25 @@ double PpsDeviceCaps::max_capture_ms(uint64_t rate, int channels) const
 	if (rate == 0)
 		return 500.0;
 
-	// hw_depth is the per-channel depth of the channel mode that was active
-	// when it was queried. The device memory is shared, so a mode with fewer
-	// channels gets proportionally more samples each: CH0-CH7 at 1 GHz holds
-	// twice the per-channel depth of CH0-CH15 at 500 MHz on the same hardware.
-	double depth = static_cast<double>(hw_depth);
-	if (depth > 0.0 && channels > 0 && channel_num > 0 &&
-			channels != channel_num)
-		depth = depth * static_cast<double>(channel_num)
-			/ static_cast<double>(channels);
+	// The device memory is shared between the probes that are switched on, and
+	// SR_CONF_HW_DEPTH already divides it by whichever probes happened to be
+	// enabled when it was queried. Use the total recorded at query time instead,
+	// then hand each active probe its share: a run with 3 probes gets
+	// total/3, whatever the mode's channel count is.
+	double depth = 0.0;
+	if (hw_depth_total > 0)
+		depth = static_cast<double>(hw_depth_total);
+	else if (hw_depth > 0 && channel_num > 0)
+		// No total recorded (old cache): assume the driver divided by the mode's
+		// channel count, which is what it does when every probe is enabled.
+		depth = static_cast<double>(hw_depth) *
+			static_cast<double>(channel_num);
 
 	if (depth <= 0.0)
 		return 500.0;
+
+	if (channels > 0)
+		depth /= static_cast<double>(channels);
 	return depth / static_cast<double>(rate) * 1000.0;
 }
 
@@ -355,6 +384,22 @@ bool query_device_caps(SigSession *session, PpsDeviceCaps &caps)
 	if (dev->get_config_uint64(SR_CONF_HW_DEPTH, depth))
 		caps.hw_depth = depth;
 
+	// SR_CONF_HW_DEPTH is the device memory divided by the number of probes that
+	// happen to be enabled at query time (dsl_channel_depth() in the driver), not
+	// by the channel count of the mode. Recover the total here, so the capture
+	// window can later be derived from the probes a run really uses.
+	int enabled_probes = 0;
+	for (const GSList *l = dev->get_channels(); l; l = l->next) {
+		const sr_channel *probe = static_cast<const sr_channel *>(l->data);
+		if (probe != nullptr && probe->enabled)
+			++enabled_probes;
+	}
+	if (caps.hw_depth > 0) {
+		const int divisor = enabled_probes > 0 ? enabled_probes : 1;
+		caps.hw_depth_total = caps.hw_depth *
+			static_cast<uint64_t>(divisor);
+	}
+
 	uint64_t max_rate = 0;
 	if (dev->get_config_uint64(SR_CONF_MAX_DSO_SAMPLERATE, max_rate))
 		caps.max_rate = max_rate;
@@ -448,6 +493,36 @@ void PpsManager::set_calib_factor(double f)
 		_config.calib_factor = f;
 		save_config();
 	}
+}
+
+bool PpsManager::apply_save_options(const PpsConfig &cfg)
+{
+	// Only the fields the frame path reads directly are taken from the dialog
+	// while a measurement runs: whether to save at all, the two trigger
+	// conditions, the save directory and the per-channel "保存" ticks. The
+	// channel list itself is never replaced, because the statistics arrays are
+	// indexed by position and the hardware is already streaming that set.
+	_config.dsl_save_loss = cfg.dsl_save_loss;
+	_config.dsl_save_abnormal = cfg.dsl_save_abnormal;
+	_config.dsl_save_always = cfg.dsl_save_always;
+	if (!cfg.save_dir.isEmpty())
+		_config.save_dir = cfg.save_dir;
+
+	for (size_t i = 0; i < _config.channels.size(); ++i) {
+		for (size_t k = 0; k < cfg.channels.size(); ++k) {
+			if (cfg.channels[k].channel_index !=
+					_config.channels[i].channel_index)
+				continue;
+			_config.channels[i].save_on_loss = cfg.channels[k].save_on_loss;
+			break;
+		}
+	}
+
+	save_config();
+	dsv_info("1PPS dsl options updated while running: loss=%d abnormal=%d "
+		"always=%d", (int)_config.dsl_save_loss,
+		(int)_config.dsl_save_abnormal, (int)_config.dsl_save_always);
+	return true;
 }
 
 void PpsManager::load_config()
@@ -560,6 +635,9 @@ std::vector<int> PpsManager::measured_channel_set() const
 
 PpsManager::~PpsManager()
 {
+	// Never leave the process wide run counter raised: a deferred calibration
+	// restore would then wait for a measurement that no longer exists.
+	set_running(false);
 	if (_watchdog) {
 		_watchdog->stop();
 		_watchdog = nullptr;
@@ -661,14 +739,17 @@ bool PpsManager::save_frame_file(const QString &tag, const QStringList &reasons)
 	// the capture loop and the UI indefinitely.
 	auto t_begin = std::chrono::steady_clock::now();
 
-	// meta/decoders/session generation and the zip file creation run on this
-	// (caller) thread inside save_start(); only the chunk writing is threaded.
+	// save_start() only validates and starts the worker; the JSON documents,
+	// the zip creation and the chunk writing all happen on that worker, so
+	// "setup" here is just the thread hand-off.
 	auto store = std::make_shared<StoreSession>(_session);
 	store->set_file_name(path);
 	store->_sessionDataGetter = _data_getter;
 	if (!store->save_start()) {
 		dsv_err("1PPS dsl: save failed for %s: %s",
 			path.toLocal8Bit().constData(), store->error().toLocal8Bit().constData());
+		_last_save_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - t_begin).count();
 		return false;
 	}
 	const qint64 setup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -713,12 +794,18 @@ bool PpsManager::save_frame_file(const QString &tag, const QStringList &reasons)
 		// joining it, and keep the shared state alive through its captures.
 		if (waiter.joinable())
 			waiter.detach();
+		_last_save_ms = (double)std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - t_begin).count();
 		dsv_err("1PPS dsl: save for %s timed out after %d ms, cancelled",
 			path.toLocal8Bit().constData(), kSaveTimeoutMs);
 		return false;
 	}
 	if (waiter.joinable())
 		waiter.join();
+
+	const qint64 total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - t_begin).count();
+	_last_save_ms = (double)total_ms;
 
 	if (!ctx->err.isEmpty()) {
 		dsv_err("1PPS dsl: store error for %s: %s",
@@ -727,8 +814,6 @@ bool PpsManager::save_frame_file(const QString &tag, const QStringList &reasons)
 	}
 
 	_last_dsl_path = path;
-	const qint64 total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-		std::chrono::steady_clock::now() - t_begin).count();
 	dsv_info("1PPS dsl: frame %d saved to %s (%s) in %lld ms (setup %lld ms, write %lld ms)",
 		_frame_count,
 		path.toLocal8Bit().constData(),
@@ -891,8 +976,15 @@ bool PpsManager::apply_hardware_config()
 	// Remember the probe flags before anything here touches the mode: switching
 	// the channel mode rebuilds the probe list with defaults, so a snapshot taken
 	// later would not describe the user's setup.
-	if (!_dev_backup.valid)
-		_dev_backup.capture(dev);
+	if (!_dev_backup.valid) {
+		// A calibration run that just ended may still be waiting to put the
+		// device back. Its snapshot describes the user's setup, while the device
+		// right now still carries the calibration's; adopt the snapshot, or this
+		// run would "restore" the calibration's channel mode and probes when it
+		// stops.
+		if (!PpsCalibration::take_pending_state(&_dev_backup))
+			_dev_backup.capture(dev);
+	}
 
 	// Single capture, buffer (not stream) operation.
 	// The driver switches buffer/stream through SR_CONF_OPERATION_MODE;
@@ -971,10 +1063,32 @@ bool PpsManager::apply_hardware_config()
 	// would be undone.
 	dev->set_config_uint64(SR_CONF_SAMPLERATE, rate);
 
+	// Probes this run will switch on (the reference plus every measured channel,
+	// limited to the mode's range). The device memory is shared between them, so
+	// the window that actually fits is total_memory / probes - not the depth the
+	// driver happened to report for whatever probe set was on at query time.
+	QSet<int> needed;
+	needed.insert(_config.ref_channel);
+	for (size_t i = 0; i < _config.channels.size(); ++i)
+		needed.insert(_config.channels[i].channel_index);
+	int want_en = 0;
+	for (int idx : needed) {
+		if (idx >= 0 && idx < ch_num)
+			++want_en;
+	}
+
+	uint64_t per_probe_depth = _caps.hw_depth;
+	if (_caps.hw_depth_total > 0 && want_en > 0)
+		per_probe_depth = _caps.hw_depth_total / static_cast<uint64_t>(want_en);
+
 	uint64_t sample_count = static_cast<uint64_t>(
 		rate * _config.capture_time_ms / 1000.0);
-	if (_caps.hw_depth != 0 && sample_count > _caps.hw_depth)
-		sample_count = _caps.hw_depth;
+	if (per_probe_depth != 0 && sample_count > per_probe_depth) {
+		dsv_warn("1PPS: %.1f ms needs %" G_GUINT64_FORMAT " samples, hardware "
+			"holds %" G_GUINT64_FORMAT " for %d probe(s); window shortened.",
+			_config.capture_time_ms, sample_count, per_probe_depth, want_en);
+		sample_count = per_probe_depth;
+	}
 	if (sample_count == 0)
 		return false;
 	dev->set_config_uint64(SR_CONF_LIMIT_SAMPLES, sample_count);
@@ -987,11 +1101,6 @@ bool PpsManager::apply_hardware_config()
 	// Channels outside the active mode's range can never be captured, but the
 	// driver keeps the full probe list, so they are switched off as well: leaving
 	// them on would keep them listed as enabled in the main window.
-	QSet<int> needed;
-	needed.insert(_config.ref_channel);
-	for (size_t i = 0; i < _config.channels.size(); ++i)
-		needed.insert(_config.channels[i].channel_index);
-
 	int en_ch_num = 0;
 	GSList *chs = dev->get_channels();
 	for (GSList *l = chs; l != nullptr; l = l->next) {
@@ -1089,6 +1198,9 @@ bool PpsManager::start()
 		return true;
 
 	_start_error.clear();
+	// Every new run starts the edge search sample by sample again: the pulse
+	// width of the previous run says nothing about this one.
+	_decoder.reset_steps();
 	auto fail = [this](const QString &msg) {
 		_start_error = msg;
 		emit status_message(msg);
@@ -1143,7 +1255,7 @@ bool PpsManager::start()
 	_csv_path = QDir(_config.save_dir).filePath(
 		PpsWriter::build_file_name(QDateTime::currentDateTime()));
 
-	_running = true;
+	set_running(true);
 	// The run clock drives the dock's "测试时长" and the wave history time axis.
 	_run_elapsed_ms = 0;
 	_run_timer.start();
@@ -1151,8 +1263,15 @@ bool PpsManager::start()
 	// decoder may be added or decoded until it stops.
 	_session->set_generic_decode_blocked(true, QString::fromUtf8(
 		"1PPS 测量正在运行，期间禁止使用通用解码器；请先停止 1PPS 测量。"));
+	// Keep the measured frame on the main waveform until the next one replaces
+	// it, instead of blanking the view when each capture starts.
+	_session->set_keep_view_on_capture(true);
 	if (!launch_capture()) {
-		_running = false;
+		set_running(false);
+		// The measurement never got going: hand the view back to normal capture,
+		// otherwise the next ordinary run keeps the stale waveform on screen and
+		// never shows its progress page.
+		_session->set_keep_view_on_capture(false);
 		_session->set_generic_decode_blocked(false);
 		restore_probe_state();
 		return fail(QString::fromUtf8("启动采集失败，无法开始 1PPS 测量。"));
@@ -1191,7 +1310,7 @@ void PpsManager::stop()
 	// stayed dead forever if the edge never came. Abort the pending capture
 	// here, then mark the run over so any late frame is ignored.
 	_stop_requested = true;
-	_running = false;
+	set_running(false);
 	if (_run_timer.isValid() && _run_timer.elapsed() > _run_elapsed_ms)
 		_run_elapsed_ms = _run_timer.elapsed();
 	if (_watchdog)
@@ -1207,6 +1326,8 @@ void PpsManager::stop()
 	// without the user clicking it.
 	if (_session)
 		_session->set_generic_decode_blocked(false);
+	if (_session)
+		_session->set_keep_view_on_capture(false);
 	dsv_info("1PPS stop: %d frame(s) measured, capture %.1f ms",
 		_frame_count, _config.capture_time_ms);
 	emit status_message(QString::fromUtf8("1PPS 测量已停止。"));
@@ -1246,6 +1367,7 @@ void PpsManager::process_frame()
 		return;
 	}
 	_in_frame = true;
+	_last_save_ms = 0.0;
 	struct FrameGuard {
 		bool *flag;
 		~FrameGuard() { *flag = false; }
@@ -1261,7 +1383,7 @@ void PpsManager::process_frame()
 		const uint64_t sample_rate = _session->cur_samplerate();
 		const uint64_t ref_pos = _session->get_trigger_pos();
 
-		PpsDecoder decoder;
+		PpsDecoder &decoder = _decoder;
 		_last = decoder.decode(snap, sample_count, sample_rate,
 				ref_pos, _config.channels,
 				_config.dsl_save_abnormal && !_config.dsl_save_always);
@@ -1388,11 +1510,18 @@ void PpsManager::process_frame()
 			}
 		}
 
+		// The per-frame cost the user cares about is the time this trigger really
+		// took: capture window + USB upload/decode + the DSL write it triggered. The
+		// save runs inside this frame, before the trigger is re-armed, so it belongs
+		// in the total even though the driver never measured it.
+		if (_last_save_ms > 0.0)
+			_last_total_ms += _last_save_ms;
+
 		emit frame_updated();
 	}
 
 	if (_stop_requested) {
-		_running = false;
+		set_running(false);
 		ds_trigger_set_en(0);
 		if (_watchdog)
 			_watchdog->stop();
@@ -1404,7 +1533,10 @@ void PpsManager::process_frame()
 
 	// Immediate re-trigger with the same configuration.
 	if (!launch_capture()) {
-		_running = false;
+		set_running(false);
+		// Leave the view in keep mode only while a measurement owns it.
+		if (_session)
+			_session->set_keep_view_on_capture(false);
 		if (_session)
 			_session->set_generic_decode_blocked(false);
 		if (_watchdog)

@@ -172,6 +172,7 @@ public:
     bool pps_configure(const QJsonObject &cfg, QString &error) override;
     bool pps_start(QString &error) override;
     void pps_stop() override;
+    bool pps_is_running() override;
     QJsonObject pps_status() override;
 
     //mcp::IConsoleTextProvider — what the decoder console window currently shows.

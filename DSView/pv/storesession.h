@@ -67,7 +67,18 @@ public:
 	void cancel();
 
 private:
-    void save_proc(pv::data::Snapshot *snapshot);
+    void save_proc(pv::data::Snapshot *snapshot, std::string meta_data,
+            std::string decoder_data, std::string session_data);
+    // Header / decoders / session JSON generation. Must run on the caller's
+    // thread: they read the session's signal list and the trigger widget, both of
+    // which the GUI thread owns and may destroy (a stop reloads the signals
+    // while a save is still running).
+    bool gen_archive_texts(pv::data::Snapshot *snapshot, std::string &meta_data,
+            std::string &decoder_data, std::string &session_data);
+    // zip creation and the three header writes, run inside the worker; it only
+    // touches the strings it was handed.
+    bool prepare_archive(data::Snapshot *snapshot, const std::string &meta_data,
+            const std::string &decoder_data, const std::string &session_data);
     void save_logic(pv::data::LogicSnapshot *logic_snapshot);
     void save_analog(pv::data::AnalogSnapshot *analog_snapshot);
     void save_dso(pv::data::DsoSnapshot *dso_snapshot);

@@ -333,8 +333,16 @@ void LogicSnapshot::append_cross_payload(const sr_datafeed_logic &logic)
     index1 = (align_sample_count / LeafBlockSamples) % RootScale;
     offset =  align_sample_count % LeafBlockSamples;
 
-    if (index0 >= _ch_data[0].size()){
-        assert(false);
+    // assert() is compiled out of a release build, so a block table that is
+    // shorter than the sample ring used to turn straight into an out-of-bounds
+    // write here. Refuse the payload instead and let the caller report the
+    // failed allocation.
+    if (_ch_data.empty() || index0 >= _ch_data[fill_chan_index].size()){
+        dsv_err("ERROR:LogicSnapshot::append_cross_payload(),block table too short "
+                "(index0 %" G_GUINT64_FORMAT ", roots %" G_GUINT64_FORMAT ").",
+                index0, (uint64_t)_ch_data.size());
+        _memory_failed = true;
+        return;
     }
     
     lbp = _ch_data[fill_chan_index][index0].lbp[index1];
@@ -380,6 +388,14 @@ void LogicSnapshot::append_cross_payload(const sr_datafeed_logic &logic)
             filled_sample = align_sample_count % LeafBlockSamples;
             old_filled_sample = filled_sample;
 
+            if (_ch_data.empty() || index0 >= _ch_data[fill_chan_index].size()){
+                dsv_err("ERROR:LogicSnapshot::append_cross_payload(),block table too short "
+                        "(index0 %" G_GUINT64_FORMAT ", roots %" G_GUINT64_FORMAT ").",
+                        index0, (uint64_t)_ch_data.size());
+                _memory_failed = true;
+                return;
+            }
+
             lbp = _ch_data[fill_chan_index][index0].lbp[index1];
             if (lbp == NULL){
                 lbp = malloc(LeafBlockSpace);
@@ -410,6 +426,14 @@ void LogicSnapshot::append_cross_payload(const sr_datafeed_logic &logic)
             filled_sample = align_sample_count % LeafBlockSamples;
             old_filled_sample = filled_sample;
 
+            if (_ch_data.empty() || index0 >= _ch_data[fill_chan_index].size()){
+                dsv_err("ERROR:LogicSnapshot::append_cross_payload(),block table too short "
+                        "(index0 %" G_GUINT64_FORMAT ", roots %" G_GUINT64_FORMAT ").",
+                        index0, (uint64_t)_ch_data.size());
+                _memory_failed = true;
+                return;
+            }
+
             lbp = _ch_data[fill_chan_index][index0].lbp[index1];
             if (lbp == NULL){
                 lbp = malloc(LeafBlockSpace);
@@ -435,6 +459,14 @@ void LogicSnapshot::append_cross_payload(const sr_datafeed_logic &logic)
     }
 
     _ch_fraction = last_chan_index;
+
+    if (_ch_data.empty() || index0 >= _ch_data[_ch_fraction].size()){
+        dsv_err("ERROR:LogicSnapshot::append_cross_payload(),block table too short "
+                "(index0 %" G_GUINT64_FORMAT ", roots %" G_GUINT64_FORMAT ").",
+                index0, (uint64_t)_ch_data.size());
+        _memory_failed = true;
+        return;
+    }
 
     lbp = _ch_data[_ch_fraction][index0].lbp[index1];
     if (lbp == NULL){
@@ -477,14 +509,34 @@ void LogicSnapshot::capture_ended()
 
     if (offset > 0)
     {
+        // The block that holds the tail is not guaranteed to exist: append
+        // stores blocks lazily and calc_mipmap() releases a block again as soon
+        // as it turns out to be all zero. A missing block therefore means "no
+        // samples here", so there is no tail to clear and nothing to fold into
+        // the mipmap. The old code logged a null buffer and then carried on with
+        // assert(false) - a no-op in a release build - and wrote to
+        // NULL + offset, which killed the USB feeder thread on stop.
+        const uint64_t root_count = _ch_data.empty() ? 0 : (uint64_t)_ch_data[0].size();
+        if (_ch_data.size() < _channel_num || index0 >= root_count){
+            dsv_err("ERROR:LogicSnapshot::capture_ended(),ring %" G_GUINT64_FORMAT
+                    " has no block table (roots %" G_GUINT64_FORMAT
+                    ", channels %u/%" G_GUINT64_FORMAT ").",
+                    _ring_sample_count, root_count, _channel_num,
+                    (uint64_t)_ch_data.size());
+            return;
+        }
+
         for (unsigned int chan=0; chan<_channel_num; chan++)
         { 
-            if (_ch_data[chan][index0].lbp[index1] == NULL){
-                dsv_err("ERROR:LogicSnapshot::capture_ended(),buffer is null.");
-                assert(false);
+            void *lbp = _ch_data[chan][index0].lbp[index1];
+            if (lbp == NULL){
+                // Released as all-zero while the frame was filling, so this
+                // block holds no samples at all.
+                continue;
             }
-            const uint64_t *end_ptr = (uint64_t*)_ch_data[chan][index0].lbp[index1] + (LeafBlockSamples / Scale);
-            uint64_t *ptr = (uint64_t*)((uint8_t*)_ch_data[chan][index0].lbp[index1] + offset);
+
+            const uint64_t *end_ptr = (uint64_t*)lbp + (LeafBlockSamples / Scale);
+            uint64_t *ptr = (uint64_t*)((uint8_t*)lbp + offset);
 
             while (ptr < end_ptr){
                 *ptr++ = 0;
@@ -497,7 +549,13 @@ void LogicSnapshot::capture_ended()
 
 void LogicSnapshot::calc_mipmap(unsigned int order, uint8_t index0, uint8_t index1, uint64_t samples, bool isEnd)
 {
+    if (order >= _ch_data.size() || index0 >= _ch_data[order].size())
+        return;
     void *lbp = _ch_data[order][index0].lbp[index1];
+    // An all-zero block is released as soon as it fills; there is no mipmap to
+    // recompute for a block that does not exist.
+    if (lbp == NULL)
+        return;
     void *level1_ptr = (uint8_t*)lbp + LeafBlockSamples / 8;
     void *level2_ptr = (uint8_t*)level1_ptr + LeafBlockSamples / Scale / 8;
     void *level3_ptr = (uint8_t*)level2_ptr + LeafBlockSamples / Scale / Scale / 8;

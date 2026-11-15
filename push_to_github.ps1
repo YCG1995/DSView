@@ -23,6 +23,7 @@ param(
 
     [switch]$DryRun,
 
+    # 工作树有未提交改动时也继续：改动先 git stash，推送完切回原分支后再恢复
     [switch]$AllowDirty
 )
 
@@ -36,6 +37,7 @@ function Invoke-Git {
 
 Push-Location -LiteralPath $PSScriptRoot
 $origBranch = $null
+$stashed = $false
 try {
     if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.git'))) {
         throw "不是 git 仓库: $PSScriptRoot"
@@ -49,8 +51,9 @@ try {
         throw "工作树有未提交改动，先提交或撤销后再推送。`n$($dirty -join "`n")"
     }
 
-    $localHead = (& git rev-parse $Branch).Trim()
-    if ($LASTEXITCODE -ne 0) { throw "本地分支不存在: $Branch" }
+    $localHead = (& git rev-parse --verify --quiet "refs/heads/$Branch")
+    if ($LASTEXITCODE -ne 0 -or -not $localHead) { throw "本地分支不存在: $Branch" }
+    $localHead = "$localHead".Trim()
 
     Write-Host "[1/6] fetch $Remote/$RemoteBranch"
     Invoke-Git @('fetch', $Remote, $RemoteBranch)
@@ -68,6 +71,13 @@ try {
         return
     }
 
+    if ($dirty) {
+        # read-tree --reset -u 会覆盖已跟踪文件的未提交改动，先收起来
+        Write-Host '      工作树有未提交改动，先 git stash（结束后自动恢复）'
+        Invoke-Git @('stash', 'push', '--include-untracked', '-m', 'push_to_github autostash')
+        $stashed = $true
+    }
+
     Write-Host "[2/6] 基于 $Remote/$RemoteBranch 建同步分支 push-sync"
     Invoke-Git @('switch', '-C', 'push-sync', '--no-track', "$Remote/$RemoteBranch")
 
@@ -83,7 +93,7 @@ try {
     Invoke-Git @('commit', '-m', $Message)
     $syncHead = (& git rev-parse HEAD).Trim()
     Write-Host "      push-sync = $($syncHead.Substring(0,8))"
-    Write-Host '      变更文件数: ' + (& git diff --stat "$remoteHead..HEAD" | Select-Object -Last 1)
+    Write-Host ('      变更文件数: ' + (& git diff --stat "$remoteHead..HEAD" | Select-Object -Last 1))
 
     Write-Host "[5/6] push $Remote push-sync:$RemoteBranch"
     Invoke-Git @('push', $Remote, "push-sync:$RemoteBranch")
@@ -99,7 +109,19 @@ try {
 finally {
     if ($origBranch) {
         & git switch $origBranch --quiet 2>$null
-        if ($LASTEXITCODE -eq 0) { Write-Host "已切回分支 $origBranch" }
+        $switchedBack = ($LASTEXITCODE -eq 0)
+        if ($switchedBack) { Write-Host "已切回分支 $origBranch" }
+        if ($stashed) {
+            if ($switchedBack) {
+                & git stash pop
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning '恢复未提交改动失败，改动仍在 git stash 里，请手动 git stash pop'
+                }
+            }
+            else {
+                Write-Warning "没能切回 $origBranch，未提交改动仍在 git stash 里；切回后请手动 git stash pop"
+            }
+        }
     }
     Pop-Location
 }

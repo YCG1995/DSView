@@ -27,6 +27,7 @@
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSizePolicy>
+#include <QTextStream>
 #include <QTimer>
 #include <QVariant>
 #include <QVBoxLayout>
@@ -59,11 +60,12 @@ static QString time_text(double ms)
 }
 
 PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
-		QWidget *parent)
+		bool live_only, QWidget *parent)
 	: QDialog(parent)
 	, _session(session)
 	, _result(cfg)
 	, _building(true)
+	, _live_only(live_only)
 {
 	setWindowTitle(QString::fromUtf8("1PPS 测量配置"));
 
@@ -222,8 +224,12 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 	ch_layout->setAlignment(Qt::AlignTop);
 	root->addWidget(ch_box, 0, 1, 2, 1, Qt::AlignTop);
 
+	_ref_box = ref_box;
+
 	QDialogButtonBox *buttons = new QDialogButtonBox(this);
-	QPushButton *ok = new QPushButton(QString::fromUtf8("确定"), buttons);
+	QPushButton *ok = new QPushButton(
+		_live_only ? QString::fromUtf8("应用") : QString::fromUtf8("确定"),
+		buttons);
 	QPushButton *cancel = new QPushButton(QString::fromUtf8("取消"), buttons);
 	buttons->addButton(ok, QDialogButtonBox::AcceptRole);
 	buttons->addButton(cancel, QDialogButtonBox::RejectRole);
@@ -256,9 +262,14 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 	_result.mode_channels = _range_combo->itemData(range_index).toInt();
 
 	build_rate_options();
-	build_time_options();
 	build_channel_table();
+	// The channel table decides how many probes the frame uses, so the capture
+	// time list has to be built after it exists - otherwise it is derived from
+	// "no channel ticked" and offers the longest windows no matter what the
+	// user has selected.
+	build_time_options();
 	_building = false;
+	lock_acquire_controls();
 
 	connect(_browse_btn, &QPushButton::clicked, this, &PpsConfigDlg::browse_dir);
 	connect(_ref_combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -273,6 +284,12 @@ PpsConfigDlg::PpsConfigDlg(SigSession *session, const pps::PpsConfig &cfg,
 		this, &PpsConfigDlg::on_auto_save_toggle);
 	connect(_save_multi_check, &QCheckBox::toggled,
 		this, &PpsConfigDlg::on_auto_save_toggle);
+	// The number of ticked channels decides how long a frame may be, so the
+	// capture-time list is rebuilt whenever a tick changes.
+	for (QTableWidget *t : { _channel_table, _channel_table2 }) {
+		connect(t, &QTableWidget::itemChanged,
+			this, &PpsConfigDlg::on_channel_state_changed);
+	}
 	connect(ok, &QPushButton::clicked, this, &PpsConfigDlg::on_accept);
 	connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
 
@@ -408,18 +425,54 @@ void PpsConfigDlg::sync_range_to_rate()
 }
 
 
+int PpsConfigDlg::active_channel_count() const
+{
+	// One probe for the reference channel, plus one for every ticked row. An
+	// unticked row is switched off in the hardware, so it does not consume depth.
+	int n = 1;
+	for (QTableWidget *t : { _channel_table, _channel_table2 }) {
+		for (int row = 0; row < t->rowCount(); ++row) {
+			QTableWidgetItem *item = t->item(row, 0);
+			if (item != nullptr && item->checkState() == Qt::Checked)
+				++n;
+		}
+	}
+	return n;
+}
+
+void PpsConfigDlg::on_channel_state_changed()
+{
+	if (_building)
+		return;
+	// Ticking a channel changes how many samples the frame holds, so the
+	// capture-time list has to follow it.
+	build_time_options();
+}
+
 void PpsConfigDlg::build_time_options()
 {
 	_building = true;
 	const uint64_t rate = _rate_combo->currentData().value<uint64_t>();
-	int channels = _caps.channels_for_rate(rate);
-	if (_result.mode_channels > 0 && channels > _result.mode_channels)
-		channels = _result.mode_channels;
-	double max_ms = _caps.max_capture_ms(rate, channels);
-	// The measurement is a burst per 1PPS second: keep the window well under
-	// 500 ms so the upload and the next trigger always fit.
-	if (max_ms <= 0.0 || max_ms > 500.0)
-		max_ms = 500.0;
+	int mode_channels = _caps.channels_for_rate(rate);
+	if (_result.mode_channels > 0 && mode_channels > _result.mode_channels)
+		mode_channels = _result.mode_channels;
+
+	// The window length this dialog offers follows the number of channels the
+	// frame will actually contain (reference + ticked channels), not the channel
+	// count of the device mode: the buffer memory is shared between the probes
+	// that are switched on, exactly as in the main capture configuration.
+	int active = active_channel_count();
+	if (mode_channels > 0 && active > mode_channels)
+		active = mode_channels;
+	if (active < 1)
+		active = 1;
+
+	double max_ms = _caps.max_capture_ms(rate, active);
+	// A 1PPS measurement is one burst per second: the capture has to leave room
+	// for the USB readout before the next edge arrives, so the list stops at
+	// 900 ms even when the depth would allow a longer window.
+	if (max_ms <= 0.0 || max_ms > 900.0)
+		max_ms = 900.0;
 
 	QList<double> values;
 	for (double decade = 0.001; decade <= 1000.0; decade *= 10.0) {
@@ -459,6 +512,58 @@ void PpsConfigDlg::build_time_options()
 	_time_combo->setCurrentIndex(index);
 	_result.capture_time_ms = _time_combo->itemData(index).toDouble();
 	_building = false;
+
+#if DSVIEW_TEST_HOOKS
+	// Head-less check: record what the capture-time list was built from and
+	// which entries it ended up with, so the channel-count dependency can be
+	// verified without a mouse (DSVIEW_PPS_CONFIG_DUMP=<file>).
+	const QByteArray dump_file = qgetenv("DSVIEW_PPS_CONFIG_DUMP");
+	if (!dump_file.isEmpty()) {
+		QFile f(QString::fromLocal8Bit(dump_file));
+		if (f.open(QIODevice::Append | QIODevice::Text)) {
+			QTextStream ts(&f);
+			ts << "active=" << active << " mode_channels=" << mode_channels
+			   << " rate=" << rate << " max_ms=" << max_ms << " options=";
+			for (int i = 0; i < _time_combo->count(); ++i)
+				ts << _time_combo->itemText(i)
+				   << (i + 1 < _time_combo->count() ? "|" : "");
+			ts << "\n";
+		}
+	}
+#endif
+}
+
+void PpsConfigDlg::lock_acquire_controls()
+{
+	if (!_live_only)
+		return;
+
+	// A running measurement is bound to the rate, the range, the capture window,
+	// the reference channel and the probe set it started with, so none of those
+	// may change here. Only the DSL save policy stays live: it is read from the
+	// configuration on every frame.
+	_ref_box->setEnabled(false);
+	_range_combo->setEnabled(false);
+	_rate_combo->setEnabled(false);
+	_time_combo->setEnabled(false);
+	_dir_edit->setEnabled(false);
+	_browse_btn->setEnabled(false);
+	_calib_spin->setEnabled(false);
+
+	for (QTableWidget *t : { _channel_table, _channel_table2 }) {
+		for (int row = 0; row < t->rowCount(); ++row) {
+			QTableWidgetItem *enable_item = t->item(row, 0);
+			if (enable_item != nullptr)
+				enable_item->setFlags(Qt::NoItemFlags);
+			if (QWidget *edge = t->cellWidget(row, 2))
+				edge->setEnabled(false);
+			// The per-channel “保存” tick is exactly what the user may change
+			// while measuring, so it stays enabled.
+		}
+	}
+	// Appending the state to the caption is enough: the locked widgets already
+	// show which parts are fixed, and the title says why.
+	setWindowTitle(QString::fromUtf8("1PPS 测量配置（测量运行中，仅可改 DSL 保存策略）"));
 }
 
 void PpsConfigDlg::collect_channel_state()
@@ -646,15 +751,22 @@ void PpsConfigDlg::on_range_changed()
 			" Hz, rate lowered", _result.mode_channels - 1,
 			(uint64_t)max_rate);
 	}
-	build_time_options();
+	// The capture-time list is derived from the probe count of the rows that
+	// exist, so the rows have to be rebuilt for the new range first: computing
+	// the list from the old table would offer windows the new probe set cannot
+	// hold (and hide ones it could).
 	build_channel_table();
+	build_time_options();
 }
 
 void PpsConfigDlg::on_reference_changed()
 {
 	if (_building)
 		return;
+	// The reference channel is not a table row, so changing it changes how many
+	// probes a frame uses as well.
 	build_channel_table();
+	build_time_options();
 }
 
 void PpsConfigDlg::on_rate_changed()
@@ -664,8 +776,8 @@ void PpsConfigDlg::on_rate_changed()
 	_result.sample_rate = _rate_combo->currentData().value<uint64_t>();
 	// Choosing 1GHz is as good as choosing CH0-CH7: the range follows the rate.
 	sync_range_to_rate();
-	build_time_options();
 	build_channel_table();
+	build_time_options();
 }
 
 void PpsConfigDlg::on_time_changed()

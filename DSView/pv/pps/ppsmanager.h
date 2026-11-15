@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <vector>
+#include <utility>
 #include <QObject>
 #include <QString>
 #include <QElapsedTimer>
@@ -15,6 +16,7 @@
 #include "ppsdecoder.h"
 
 class QTimer;
+class DeviceAgent;
 
 namespace pv {
 
@@ -76,7 +78,10 @@ struct PpsDeviceCaps
 {
     int channel_num;                    // channels of the active buffer mode
     uint64_t max_rate;                  // samplerate limit of the active mode
-    uint64_t hw_depth;                  // per-channel sample depth
+    uint64_t hw_depth;                  // depth reported by the driver for the
+                                        // probe set that was enabled when queried
+    uint64_t hw_depth_total;            // device memory in samples, independent of
+                                        // how many probes were switched on
     std::vector<uint64_t> rates;        // supported samplerates, ascending
     std::vector<PpsModeInfo> modes;     // buffer channel modes, largest first
 
@@ -92,8 +97,28 @@ struct PpsDeviceCaps
     const PpsModeInfo *mode_for_rate(uint64_t rate) const;
 };
 
-// Reads the capabilities above from the currently active device.
+// Reads the capabilities above from the currently active device. The device
+// is left in the operation mode, channel mode, samplerate and probe setup it
+// had before the call; while a capture is running nothing is probed and the
+// capabilities of the last full query are returned instead.
 bool query_device_caps(SigSession *session, PpsDeviceCaps &caps);
+
+/*
+ * Device settings a 1PPS measurement or a calibration run overrides, taken
+ * before the first change so they can be put back when the run ends.
+ */
+struct PpsDeviceState
+{
+    bool valid = false;
+    int op_mode = -1;                   // SR_CONF_OPERATION_MODE, -1 = unknown
+    int ch_mode = -1;                   // SR_CONF_CHANNEL_MODE, -1 = unknown
+    uint64_t sample_rate = 0;
+    std::vector<std::pair<int, bool> > probes;  // logic probe index, enabled
+
+    void capture(DeviceAgent *dev);
+    // The samplerate is only written back when with_rate is set.
+    void restore(DeviceAgent *dev, bool with_rate) const;
+};
 
 // Per-channel running statistics over valid frames.
 struct PpsStats
@@ -115,12 +140,21 @@ public:
     ~PpsManager();
 
     bool is_running() const { return _running; }
+    // True while any 1PPS measurement owns the device. The calibration run uses
+    // it to keep its deferred device restore out of a running measurement:
+    // switching the mode under a live capture rebuilds the probe list the run is
+    // decoding against.
+    static bool any_running();
     // Reason of the last failed start(), for the UI to surface it.
     const QString &start_error() const { return _start_error; }
     const PpsConfig &config() const { return _config; }
     // Stores the configuration and persists it, so the settings survive a
-    // restart without the dialog being opened first.
-    void set_config(const PpsConfig &cfg);
+    // restart without the dialog being opened first. Refused (returns false)
+    // while a measurement is running.
+    bool set_config(const PpsConfig &cfg);
+    // True while the device still waits to get its pre-run setup back (the
+    // capture was still unwinding when the run stopped).
+    bool restore_pending() const { return _dev_backup.valid; }
     // Reads the persisted configuration (called once from the constructor).
     void load_config();
     void save_config() const;
@@ -128,6 +162,10 @@ public:
     // live config so the next frame is already compensated.
     double calib_factor() const { return _config.calib_factor; }
     void set_calib_factor(double f);
+    // The DSL save policy (数据丢失 / 异常脉冲 / 每通道“保存” / 保存目录) is read on
+    // every frame, so it can be changed while a measurement runs. Everything else
+    // (rate, range, capture window, channels) still needs a stopped run.
+    bool apply_save_options(const pps::PpsConfig &cfg);
     // The channel set this configuration measures: reference channel plus every
     // enabled measured channel. Used to mirror the setup into the main view.
     std::vector<int> measured_channel_set() const;
@@ -153,9 +191,11 @@ public:
     const std::vector<PpsResult> &last_results() const { return _last; }
     std::vector<PpsStats> statistics() const;
     int frame_count() const { return _frame_count; }
-    // Per-frame timing: nominal capture window, measured upload+decode, total.
+    // Per-frame timing: nominal capture window, measured upload+decode, the
+    // DSL save this frame spent, and the total of all of them.
     double last_capture_ms() const { return _last_capture_ms; }
     double last_report_ms() const { return _last_report_ms; }
+    double last_save_ms() const { return _last_save_ms; }
     double last_total_ms() const { return _last_total_ms; }
     // Wall time since "开始测量", frozen when the run stops.
     qint64 run_elapsed_ms() const;
@@ -171,7 +211,7 @@ public:
     // middle of a run still shows the whole run instead of starting empty.
     struct PpsWaveFrame
     {
-        qint64 t_ms;                    // ms since the run started
+        qint64 t_ms;                    // wall clock, ms since the epoch
         std::vector<double> values;     // per measured channel, ns
         std::vector<char> valid;
     };
@@ -181,21 +221,23 @@ public:
 signals:
     void frame_updated();
     void status_message(const QString &text);
+    // The device got its pre-run channel mode and probe setup back.
+    void device_restored();
 
 private:
+    void sanitize_config();
     bool apply_hardware_config();
     void process_frame();
     bool launch_capture();
     void reset_statistics();
-    // No-data watchdog: if the very first frame never arrives (typically because
-    // the reference channel has no 1PPS signal, so the FPGA trigger never fires)
-    // the capture is aborted with a message instead of waiting forever.
+    // No-data watchdog: if no frame arrives (typically because the reference
+    // channel has no 1PPS signal, so the FPGA trigger never fires) a message is
+    // shown and the measurement stays armed until the user stops it.
     void arm_watchdog();
     void on_watchdog_timeout();
     // Save the current frame as a .dsl file; `tag` becomes the file name prefix
     // (LOSS / MULTI / FRAME) and `reasons` is the human readable cause. Returns
     // true when a file was written.
-    bool save_loss_frame(const std::vector<PpsResult> &results);
     bool save_frame_file(const QString &tag, const QStringList &reasons);
     // Append the frame that was just measured to the wave history.
     void record_wave_frame();
@@ -207,6 +249,9 @@ private:
     QTimer *_watchdog = nullptr;
     PpsConfig _config;
     PpsDeviceCaps _caps;
+    // Setter for the run state: keeps the process wide "a measurement owns the
+    // device" counter (any_running()) in sync with _running.
+    void set_running(bool running);
     bool _running;
     bool _stop_requested;
     QString _start_error;
@@ -233,11 +278,17 @@ private:
     qint64 _last_loss_save_ms = -1;
     int _loss_skipped = 0;
 
+    // Persistent per-channel coarse-step state (first pass sample by sample,
+    // later passes from the measured pulse width). One instance per run.
+    PpsDecoder _decoder;
+
     // Timing of the current/last frame: capture window plus the time the
-    // driver took to move the samples over USB and decode them.
+    // driver took to move the samples over USB and decode them, plus the DSL
+    // save this frame triggered (0 for frames that saved nothing).
     QElapsedTimer _frame_timer;
     double _last_capture_ms;
     double _last_report_ms;
+    double _last_save_ms = 0.0;
     double _last_total_ms;
     // Run clock: starts at 开始测量 and is frozen at 停止, so the dock can show
     // "测试时长" that keeps its value after the run ends.
@@ -250,14 +301,12 @@ private:
     // Probe enable flags as they were before the run started. A run needs the
     // hardware to stream only a subset, so the flags are put back on stop - a
     // measurement must not leave the user's channel setup changed.
-    std::vector<std::pair<int, bool> > _probe_backup;
-    bool _probe_backup_valid = false;
     // Device settings the run overrides, put back with the probes. A run may
     // switch the channel mode (16ch/8ch) and the samplerate; leaving those changed
     // would resize the main window's channel table and hide channels the user
     // still has switched on.
-    int _op_mode_backup = 0;
-    int _ch_mode_backup = -1;
+    PpsDeviceState _dev_backup;
+    int _restore_retries = 0;
     bool _mode_switched = false;
     void restore_probe_state();
 

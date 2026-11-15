@@ -241,11 +241,16 @@ void PpsResultDock::update_info_line()
 		// Whole milliseconds: a per-frame breakdown to 0.1 ms in the summary line
 		// was noise, the tooltip keeps the exact split.
 		cost = QString::number(qRound(_manager->last_total_ms())) + " ms";
-		breakdown = QString::fromUtf8(
-			"采集 %1 ms + 上报 %2 ms = 共 %3 ms")
-			.arg(fmt(_manager->last_capture_ms()))
-			.arg(fmt(_manager->last_report_ms()))
-			.arg(fmt(_manager->last_total_ms()));
+		breakdown = _manager->last_save_ms() > 0.0
+			? QString::fromUtf8("采集 %1 ms + 上报 %2 ms + 保存 %3 ms = 共 %4 ms")
+				.arg(fmt(_manager->last_capture_ms()))
+				.arg(fmt(_manager->last_report_ms()))
+				.arg(fmt(_manager->last_save_ms()))
+				.arg(fmt(_manager->last_total_ms()))
+			: QString::fromUtf8("采集 %1 ms + 上报 %2 ms = 共 %3 ms")
+				.arg(fmt(_manager->last_capture_ms()))
+				.arg(fmt(_manager->last_report_ms()))
+				.arg(fmt(_manager->last_total_ms()));
 	}
 	// 测试时长: wall time since 开始测量, frozen once the run stops.
 	const QString elapsed = fmtDuration(_manager->run_elapsed_ms());

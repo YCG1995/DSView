@@ -167,34 +167,62 @@ bool StoreSession::save_start()
         return false;
     }
 
+    // The three JSON documents are generated here, on the calling thread: they
+    // walk the session's signal list and read the trigger widget, and both belong
+    // to the GUI thread. A stop during a save reloads and rebuilds the signals,
+    // so doing that from the worker would dereference objects the GUI thread is
+    // freeing. This costs a few hundred kilobytes of string building, not the 300
+    // ms sleep that used to dominate; the zip creation and every data write stay
+    // in the worker.
     std::string meta_data;
     std::string decoder_data;
     std::string session_data;
-    
+    if (!gen_archive_texts(snapshot, meta_data, decoder_data, session_data))
+        return false;
+
+    if (_thread.joinable())
+        _thread.join();
+    _has_error = false;
+    _error.clear();
+    _canceled = false;
+    _is_busy = true;
+    _thread = std::thread(&StoreSession::save_proc, this, snapshot,
+            std::move(meta_data), std::move(decoder_data),
+            std::move(session_data));
+    return true;
+}
+
+bool StoreSession::gen_archive_texts(data::Snapshot *snapshot,
+        std::string &meta_data, std::string &decoder_data,
+        std::string &session_data)
+{
     meta_gen(snapshot, meta_data);
     decoders_gen(decoder_data);
     _sessionDataGetter->genSessionData(session_data);
 
     if (meta_data.empty()) {
         _error = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_STORESESS_SAVESTART_ERROR4), "Generate temp file data failed.");
-        QFile::remove(_file_name);
         return false;
     }
     if (decoder_data.empty()){
         _error = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_STORESESS_SAVESTART_ERROR5), "Generate decoder file data failed.");
-        QFile::remove(_file_name);
         return false;
     }
     if (session_data.empty()){
         _error = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_STORESESS_SAVESTART_ERROR6), "Generate session file data failed.");
-        QFile::remove(_file_name);
         return false;
     }
-   
+    return true;
+}
+
+bool StoreSession::prepare_archive(data::Snapshot *snapshot,
+        const std::string &meta_data, const std::string &decoder_data,
+        const std::string &session_data)
+{
     auto _filename = path::ConvertPath(_file_name);
-    
+
     if (m_zipDoc.CreateNew(_filename.c_str(), false))
-    {    
+    {
         if ( !m_zipDoc.AddFromBuffer("header", meta_data.c_str(), meta_data.size())
             || !m_zipDoc.AddFromBuffer("decoders", decoder_data.c_str(), decoder_data.size())
             || !m_zipDoc.AddFromBuffer("session", session_data.c_str(), session_data.size())
@@ -202,19 +230,12 @@ bool StoreSession::save_start()
         {
             _has_error = true;
             _error = m_zipDoc.GetError();
+            return false;
         }
-        else
-        {
-            if (_thread.joinable()) _thread.join();
-            _thread = std::thread(&StoreSession::save_proc, this, snapshot);
-            return !_has_error;
-        }
-    }
-    else{
-         _error = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_STORESESS_SAVESTART_ERROR7), "Generate zip file failed.");
+        return true;
     }
 
-    QFile::remove(_file_name);
+    _error = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_STORESESS_SAVESTART_ERROR7), "Generate zip file failed.");
     return false;
 }
 
@@ -349,8 +370,19 @@ void StoreSession::save_logic(pv::data::LogicSnapshot *logic_snapshot)
             if (_units_stored > _unit_count 
                     && start_index == 0
                     && end_index == 0){
+                // A release build compiles the old assert() away, so this went on
+                // to write a truncated archive and report success. Stop here and
+                // leave an error plus no partial file instead.
                 dsv_err("Read block data error!");
-                assert(false);
+                _has_error = true;
+                _error = L_S(STR_PAGE_DLG, S_ID(IDS_MSG_STORESESS_SAVEPROC_ERROR2),
+                            "Failed to create zip file. Please check write permission of this path.");
+                if (need_malloc){
+                    free(block_buf);
+                }
+                QFile::remove(_file_name);
+                progress_updated();
+                return;
             }
 
             if (need_malloc){
@@ -409,9 +441,15 @@ void StoreSession::save_analog(pv::data::AnalogSnapshot *analog_snapshot)
             if ((buf + size) > buf_end) {
                 uint8_t *tmp = (uint8_t *)malloc(size);
                 if (tmp == NULL) {
+                    // Bail out instead of handing a NULL buffer to the zip
+                    // writer: the old code set the error message and then went
+                    // straight on to AddFromBuffer(chunk_name, NULL, size).
                     _has_error = true;
                     _error = L_S(STR_PAGE_DLG, S_ID(IDS_MSG_STORESESS_SAVEPROC_ERROR1), 
                                 "Failed to create zip file. Malloc error.");
+                    progress_updated();
+                    QFile::remove(_file_name);
+                    return;
                 } else {
                     memcpy(tmp, buf, buf_end-buf);
                     memcpy(tmp+(buf_end-buf), buf_start, buf+size-buf_end);
@@ -521,7 +559,8 @@ void StoreSession::save_dso(pv::data::DsoSnapshot *dso_snapshot)
     }
 }
 
-void StoreSession::save_proc(data::Snapshot *snapshot)
+void StoreSession::save_proc(data::Snapshot *snapshot, std::string meta_data,
+        std::string decoder_data, std::string session_data)
 {
 	assert(snapshot);
 
@@ -532,6 +571,14 @@ void StoreSession::save_proc(data::Snapshot *snapshot)
     _is_busy = true;
 
     dsv_info("save task start.");
+
+    if (!prepare_archive(snapshot, meta_data, decoder_data, session_data)) {
+        _has_error = true;
+        QFile::remove(_file_name);
+        dsv_info("save task end (archive setup failed).");
+        _is_busy = false;
+        return;
+    }
 
     if ((logic_snapshot = dynamic_cast<data::LogicSnapshot*>(snapshot))) {
         save_logic(logic_snapshot);
@@ -546,6 +593,20 @@ void StoreSession::save_proc(data::Snapshot *snapshot)
     dsv_info("save task end.");
 
     _is_busy = false;
+}
+
+// Channel names and triggers are user data that end up inside a
+// line-oriented "key = value" header. A CR/LF inside one of them terminates the
+// line early and whatever follows is parsed as a second header key when the
+// file is opened again: a channel named "A\nprobe5 = x" produced a .dsl that
+// loaded with nine channels instead of eight, with a duplicate index 5.
+// Replace every control character before it can reach the header.
+static void append_header_field(std::string &out, const char *value)
+{
+    for (const char *p = value; p && *p; p++) {
+        const unsigned char c = (unsigned char)*p;
+        out += (c < 0x20 || c == 0x7f) ? ' ' : (char)c;
+    }
 }
 
 bool StoreSession::meta_gen(data::Snapshot *snapshot, std::string &str)
@@ -682,16 +743,23 @@ bool StoreSession::meta_gen(data::Snapshot *snapshot, std::string &str)
         if (mode == LOGIC && !probe->enabled)
             continue;
 
+        // Probe names are user data: they come from the rename dialog, from
+        // set_channel_name over MCP, and from the header of an opened .dsl.
+        // sprintf'ing them into the fixed 300-byte "meta" buffer wrote past its
+        // end for a long name (a 340-character name killed the process on save).
+        // Build these two lines directly into the std::string instead.
         if (probe->name)
         {
             int sigdex = (mode == LOGIC) ? probe->index : probecnt;
-            sprintf(meta, "probe%d = %s\n", sigdex, probe->name);
-            str += meta;
+            str += "probe" + std::to_string(sigdex) + " = ";
+            append_header_field(str, probe->name);
+            str += "\n";
         }
 
         if (probe->trigger){
-            sprintf(meta, " trigger%d = %s\n", probecnt, probe->trigger); 
-            str += meta;
+            str += " trigger" + std::to_string(probecnt) + " = ";
+            append_header_field(str, probe->trigger);
+            str += "\n";
         }
 
         if (mode == DSO)
@@ -847,6 +915,10 @@ bool StoreSession::export_start()
     if (_outModule == NULL)
     {
         _error = L_S(STR_PAGE_DLG, S_ID(IDS_MSG_STORESESS_EXPORTSTART_ERROR4), "Invalid export format.");
+        // Return the reason to the caller: clearing it here made "Invalid export
+        // format." unreachable, so an unsupported suffix came back as a bare
+        // failure with nothing for the UI or MCP to show.
+        return false;
     }
     else
     {
@@ -854,9 +926,6 @@ bool StoreSession::export_start()
         _thread = std::thread(&StoreSession::export_proc, this, snapshot);
         return !_has_error;
     }
-
-    _error.clear();
-    return false;
 }
 
 void StoreSession::export_proc(data::Snapshot *snapshot)
@@ -898,11 +967,17 @@ void StoreSession::export_exec(data::Snapshot *snapshot)
         return;
     }
 
-    GHashTable *params = g_hash_table_new(g_str_hash, g_str_equal);
-    GVariant* filenameGVariant = g_variant_new_bytestring(_file_name.toUtf8().data());
-    g_hash_table_insert(params, (char*)"filename", filenameGVariant);
-    GVariant* typeGVariant = g_variant_new_int16(channel_type);
-    g_hash_table_insert(params, (char*)"type", typeGVariant);
+    // The hash table is the owner of both variants: it is created with a value
+    // destroy func and each variant is sunk on insert, so the module may keep a
+    // reference and the table no longer outlives its values (before, "filename"
+    // was unref'd by hand after the table still pointed at it, and the "type"
+    // variant was never released at all).
+    GHashTable *params = g_hash_table_new_full(g_str_hash, g_str_equal, NULL,
+            (GDestroyNotify)g_variant_unref);
+    g_hash_table_insert(params, (char*)"filename",
+            g_variant_ref_sink(g_variant_new_bytestring(_file_name.toUtf8().data())));
+    g_hash_table_insert(params, (char*)"type",
+            g_variant_ref_sink(g_variant_new_int16(channel_type)));
 
     struct sr_output output;
     output.module = (sr_output_module*) _outModule;
@@ -1247,9 +1322,8 @@ void StoreSession::export_exec(data::Snapshot *snapshot)
     // optional, as QFile destructor will already do it:
     file.close();
     _outModule->cleanup(&output);
+    // Releases "filename" and "type" through the table's value destroy func.
     g_hash_table_destroy(params);
-    if (filenameGVariant != NULL)
-        g_variant_unref(filenameGVariant);
 
     progress_updated();
 }
@@ -1619,7 +1693,8 @@ double StoreSession::get_integer(GVariant *var)
     else if (g_variant_type_equal(type, G_VARIANT_TYPE_UINT64))
         val = g_variant_get_uint64(var);
     else
-        assert(false);
+        dsv_err("get_integer: unsupported variant type %s",
+                g_variant_get_type_string(var));
 
     return val;
 }

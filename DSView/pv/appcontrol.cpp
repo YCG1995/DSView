@@ -156,9 +156,13 @@ bool AppControl::Init()
 #endif
 
     //the python script path of decoder
-    char path[256] = {0};
-    QString dir = GetDecodeScriptDir();   
-    strcpy(path, dir.toUtf8().data());
+    // The decoder directory follows the install location, so it is as long as
+    // whatever folder the user unpacked the portable build into. Copying it into
+    // a fixed 256-byte char buffer with strcpy wrote past the frame for a deep
+    // path; keep the QString alive and hand srd_init its UTF-8 bytes instead.
+    const QString dir = GetDecodeScriptDir();
+    const QByteArray dir_utf8 = dir.toUtf8();
+    const char *path = dir_utf8.constData();
 
     // Initialise libsigrokdecode
     int srd_ret = srd_init(path);

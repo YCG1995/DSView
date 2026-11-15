@@ -462,6 +462,17 @@ public:
     void auto_save_release(SessionData *data);
     int  auto_save_active_count() const;
 
+    // --- 1PPS measurement display ---
+    // A 1PPS run captures one frame per second in single mode, where the view
+    // buffer and the capture buffer are the same object: clearing it at capture
+    // start blanked the waveform between two triggers. With this flag the
+    // capture goes into a second buffer so the previous frame stays on screen
+    // until the new one is complete, and only then is it swapped in.
+    void set_keep_view_on_capture(bool keep);
+    inline bool keep_view_on_capture() const {
+        return _keep_view_on_capture;
+    }
+
     inline void set_decoder_pannel(IDecoderPannel *pannel){
         _decoder_pannel = pannel;
     }
@@ -692,6 +703,14 @@ private:
     DeviceEventObject   _device_event;
     SessionData       *_view_data;
     SessionData       *_capture_data;
+    // Keep the previous frame on screen while the next one is captured (1PPS).
+    bool              _keep_view_on_capture;
+    // A frame is being captured into the second buffer and still has to be
+    // swapped into the view. Set in capture_init() when that buffer was taken,
+    // cleared when the frame ends: the swap must not depend on the live
+    // _keep_view_on_capture flag, because the run can be stopped (which clears
+    // the flag) while this frame is still in flight.
+    bool              _keep_swap_pending;
     std::vector<SessionData*> _data_list;
     IDecoderPannel  *_decoder_pannel;
     sr_status       _dso_status;

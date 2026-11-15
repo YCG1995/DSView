@@ -46,6 +46,9 @@ public:
 	virtual bool pps_configure(const QJsonObject &cfg, QString &error) = 0;
 	virtual bool pps_start(QString &error) = 0;
 	virtual void pps_stop() = 0;
+	// True while the 1PPS loop owns the capture. Unlike pps_status() this
+	// never creates the 1PPS objects.
+	virtual bool pps_is_running() = 0;
 	// Running state, frame counters, per-frame timing and the latest results.
 	virtual QJsonObject pps_status() = 0;
 };
@@ -87,7 +90,9 @@ private slots:
 	void on_disconnected();
 
 private:
-	void drain_socket(QTcpSocket *sock);
+	// Handles at most one complete request buffered for the socket; returns
+	// true when one was consumed.
+	bool process_one(QTcpSocket *sock);
 	QByteArray handle_payload(const QByteArray &payload, bool &notification);
 	QJsonObject dispatch(const QJsonObject &request, bool &notification);
 
@@ -149,6 +154,9 @@ private:
 	IPpsControl *_pps;
 	IConsoleTextProvider *_console;
 	QHash<QTcpSocket *, QByteArray> _buffers;
+	// Set while requests are being dispatched. A tool may run a nested event
+	// loop; data arriving then is only buffered and handled afterwards.
+	bool _draining = false;
 };
 
 } // namespace mcp

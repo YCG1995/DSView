@@ -62,6 +62,8 @@ StoreProgress::StoreProgress(SigSession *session, QWidget *parent) :
     _start_cursor = NULL;
     _end_cursor = NULL;
     _view = NULL;  
+    _error_reported = false;
+    _closing = false;
 
     QGridLayout *grid = new QGridLayout(); 
     _grid = grid;
@@ -117,6 +119,13 @@ StoreProgress::~StoreProgress()
 
 void StoreProgress::closeEvent(QCloseEvent* event)
 { 
+    //A nested event loop may reach closeEvent twice; deleting the object twice
+    //would corrupt the heap, so only the first pass does the teardown.
+    if (_closing) {
+        event->accept();
+        return;
+    }
+
     //Wait the thread ends.
     if (_store_session->is_busy()){
         _store_session->cancel();
@@ -124,6 +133,7 @@ void StoreProgress::closeEvent(QCloseEvent* event)
         return;
     }
    
+    _closing = true;
     _store_session->session()->set_saving(false);
     _store_session->session()->broadcast_msg(DSV_MSG_SAVE_COMPLETE);
 
@@ -149,6 +159,18 @@ void StoreProgress::on_timeout()
 {   
     //The task is end, to close the window.
     if (_store_session->is_busy() == false) {
+        // No further ticks: show_error() below opens a modal box whose nested
+        // event loop would deliver this timer again, and every nested frame
+        // would end up calling close() on a dialog an inner frame already
+        // deleted.
+        m_timer.stop();
+        // A failure can happen before the first progress update - the archive
+        // header cannot be created (unwritable path, full disk) - in which case
+        // nothing else ever reports it. Tell the user instead of closing as if
+        // the save had succeeded.
+        if (_store_session->error().isEmpty() == false) {
+            show_error();
+        }
         close();      
     }
 }
@@ -358,7 +380,15 @@ void StoreProgress::export_run()
 
 void StoreProgress::show_error()
 {
+    // One box per failed save, no matter which path gets here first: the modal
+    // box runs a nested event loop in which the poll timer and queued progress
+    // signals are delivered again, and every extra box would stack on top of
+    // the previous one.
+    if (_error_reported)
+        return;
     if (!_store_session->error().isEmpty()) { 
+        _error_reported = true;
+        m_timer.stop();
         MsgBox::Show(NULL, _store_session->error().toStdString().c_str(), NULL);
     }
 }

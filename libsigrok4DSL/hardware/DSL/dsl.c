@@ -2231,6 +2231,11 @@ static void finish_acquisition(struct DSL_context *devc)
         sr_info("frame transfer: complete in %.1f ms from first data packet",
             s_frame_ms);
     }
+    else {
+        /* No data packet was timed for this frame: report "unknown" instead
+         * of the previous frame's value. */
+        s_frame_ms = 0.0;
+    }
 
     sr_info("%s: send SR_DF_END packet", __func__);
     /* Terminate session. */

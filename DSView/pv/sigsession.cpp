@@ -116,6 +116,8 @@ namespace pv
         _data_list.push_back(new SessionData());
         _view_data = _data_list[0];
         _capture_data = _data_list[0];
+        _keep_view_on_capture = false;
+        _keep_swap_pending = false;
 
         this->add_msg_listener(this);
 
@@ -479,6 +481,31 @@ namespace pv
         _device_agent.set_config_bool(SR_CONF_INSTANT, _is_instant);
         _callback->update_capture();
 
+        // A 1PPS run keeps the frame that is on screen until the next one is
+        // complete. In single mode the view buffer and the capture buffer are
+        // the same object, so clearing it at capture start is what blanked the
+        // waveform between two triggers: take a free buffer for the incoming
+        // frame here, *before* the samplerate/limit are pushed into it, and it
+        // is swapped into the view once the frame is complete.
+        if (_keep_view_on_capture && _capture_data == _view_data) {
+            bool second_buffer_taken = false;
+            for (auto d : _data_list) {
+                if (d != _view_data && !d->is_saving()) {
+                    _capture_data = d;
+                    second_buffer_taken = true;
+                    break;
+                }
+            }
+            // Remember that this frame owes the view a swap. The run may be
+            // stopped before the frame ends, and stop clears
+            // _keep_view_on_capture; the frame already in flight must still be
+            // published.
+            _keep_swap_pending = second_buffer_taken;
+        }
+        else {
+            _keep_swap_pending = false;
+        }
+
         set_cur_snap_samplerate(_device_agent.get_sample_rate());
         set_cur_samplelimits(_device_agent.get_sample_limit());
 
@@ -493,6 +520,11 @@ namespace pv
         data_unlock();
 
         // Init data container
+        // The frame currently on screen must survive the next capture, so the
+        // buffer just chosen above is cleared here - the displayed one is not.
+        // When no other buffer is free the old behaviour stays: a buffer must
+        // always be cleared before the feed appends to it, otherwise the frame
+        // would accumulate samples.
         _capture_data->clear();
 
         int mode = _device_agent.get_work_mode();
@@ -568,10 +600,19 @@ namespace pv
         clear_all_decode_task2();
         clear_decode_result(); 
         
-        if (!_capture_data->is_saving())
-            _capture_data->clear();
-        if (!_view_data->is_saving())
-            _view_data->clear();       
+        // A 1PPS run keeps the frame that is on screen until the next one is
+        // complete, so the view buffer must not be cleared here. capture_init()
+        // then hands the incoming frame a free buffer and the swap happens once
+        // the frame is complete.
+        const bool keep_frame = _keep_view_on_capture
+                && _device_agent.get_work_mode() == LOGIC
+                && _view_data->get_logic()->have_data();
+        if (!keep_frame) {
+            if (!_capture_data->is_saving())
+                _capture_data->clear();
+            if (!_view_data->is_saving())
+                _view_data->clear();
+        }
         _is_stream_mode = false;
         _capture_times = 0;
         _dso_packet_count = 0;
@@ -882,10 +923,20 @@ namespace pv
 
             int mode = _device_agent.get_work_mode();
 
-            if (mode == DSO)
-                captured_cnt = captured_cnt * _signals.size() / get_ch_num(SR_CHANNEL_DSO);
-                
-            if (triggered)
+            if (mode == DSO) {
+                // Both counts are divisions by a device value that is 0 while no
+                // DSO probe is enabled; guard instead of crashing in the status poll.
+                const uint64_t dso_ch_num = get_ch_num(SR_CHANNEL_DSO);
+                if (dso_ch_num)
+                    captured_cnt = captured_cnt * _signals.size() / dso_ch_num;
+            }
+
+            if (sample_limits == 0) {
+                // Nothing was armed (limit not programmed yet), so there is no
+                // percentage to report. Dividing by it crashed the status poll.
+                progress = 0;
+            }
+            else if (triggered)
                 progress = (sample_limits - captured_cnt) * 100.0 / sample_limits;
             else
                 progress = captured_cnt * 100.0 / sample_limits;
@@ -1252,8 +1303,15 @@ namespace pv
                 }
             }
 
-            _capture_data->_trig_pos = trigger_pos.real_pos * probe_count / probe_en_count;
-            _callback->receive_trigger(_capture_data->_trig_pos);
+            // DSO trigger position is expressed per enabled probe; with every DSO
+            // probe disabled there is no divisor and this divided by 0. There is no
+            // trigger position to report then, so leave it at the device value.
+            if (probe_en_count) {
+                _capture_data->_trig_pos = trigger_pos.real_pos * probe_count / probe_en_count;
+                _callback->receive_trigger(_capture_data->_trig_pos);
+            } else {
+                dsv_warn("feed_in_trigger: %d DSO probe(s), none enabled", probe_count);
+            }
         }
     }
 
@@ -2717,6 +2775,15 @@ namespace pv
                     {
                         if (!_is_stream_mode)
                             bAddDecoder = true;
+                        // A 1PPS frame was captured into a second buffer so the
+                        // previous one could stay on screen; publish it now.
+                        // The decision uses the flag set when that buffer was
+                        // taken, not the live setting: stop() clears the setting
+                        // while this frame may still be in flight, and a stopped
+                        // measurement must still show the frame it last measured.
+                        if (_keep_swap_pending && _view_data != _capture_data)
+                            bSwapBuffer = true;
+                        _keep_swap_pending = false;
                     }
                     else if(is_repeat_mode())
                     {
@@ -2966,6 +3033,18 @@ namespace pv
     {
         set_cur_snap_samplerate(_device_agent.get_sample_rate());
         set_cur_samplelimits(_device_agent.get_sample_limit());
+    }
+
+    void SigSession::set_keep_view_on_capture(bool keep)
+    {
+        _keep_view_on_capture = keep;
+        if (!keep && !_is_working) {
+            // Leave the session with the invariant the rest of the code expects
+            // in single mode: the capture buffer is the displayed buffer.
+            if (_view_data != nullptr)
+                _capture_data = _view_data;
+            _keep_swap_pending = false;
+        }
     }
 
     void SigSession::clear_view_data()

@@ -24,6 +24,7 @@
 
 #include "../interface/icallbacks.h"
 #include "ppsdecoder.h"
+#include "ppsmanager.h"
 
 class QTimer;
 
@@ -79,6 +80,14 @@ public:
     // a free-running frame that starts at an arbitrary phase.
     static bool any_active();
 
+    // A calibration run that has just ended may still be waiting to put the
+    // device back. A 1PPS measurement started in that window must use that
+    // snapshot as its own baseline: capturing the calibration's setup instead
+    // would "restore" the wrong state when the measurement stops. Returns true
+    // and hands the snapshot over when one was pending (the pending restore is
+    // cancelled in that case).
+    static bool take_pending_state(PpsDeviceState *out);
+
     bool start(const PpsCalibConfig &cfg);
     void stop();
 
@@ -100,6 +109,9 @@ private:
     void widen_window_and_restart();
     void advance_after_capture(bool usable, size_t edges,
             double period_samples);
+    // Hands the device back in the operation mode, channel mode and probe
+    // setup it had before the run. Safe to call more than once.
+    void restore_device();
 
     SigSession *_session;
     PpsCalibConfig _cfg;
@@ -122,6 +134,7 @@ private:
     bool _owns_trigger;     // registered in s_active_runs
     bool _stream_mode;      // the last apply_hardware_config took the stream path
     bool _widened;          // this run already widened the window once
+    PpsDeviceState _dev_backup; // device setup before the run touched it
 };
 
 } // namespace pps

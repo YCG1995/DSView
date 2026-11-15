@@ -23,6 +23,12 @@ cmake_minimum_required(VERSION 2.8.6)
 
 project(DSView)
 
+# Release unless told otherwise. Decided here, before anything looks at the
+# build type.
+if(NOT CMAKE_BUILD_TYPE)
+	set(CMAKE_BUILD_TYPE Release)
+endif()
+
 # Upstream release builds define NDEBUG, which turns the many assert() calls
 # into no-ops. Without NDEBUG a failed assert pops up a native assertion dialog
 # *on the collect thread*; that thread then blocks forever inside the dialog,
@@ -50,7 +56,7 @@ set(DS_DESCRIPTION "A GUI for instruments of DreamSourceLab")
 
 set(DS_VERSION_MAJOR 2)
 set(DS_VERSION_MINOR 0)
-set(DS_VERSION_MICRO 1)
+set(DS_VERSION_MICRO 2)
 set(DS_VERSION_STRING  ${DS_VERSION_MAJOR}.${DS_VERSION_MINOR}.${DS_VERSION_MICRO})
 
 configure_file (
@@ -661,7 +667,7 @@ if(NOT DISABLE_WERROR)
         add_definitions(-Werror)
 endif()
 
-set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++17")
 set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=c99")
 
 
@@ -682,11 +688,10 @@ endif()
 #===============================================================================
 #= Release flags
 #-------------------------------------------------------------------------------
-set(CMAKE_CXX_FLAGS "-Wall -Wextra")
-set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
-add_compile_options(-O3)
+set(CMAKE_C_FLAGS_DEBUG "-g")
+set(CMAKE_C_FLAGS_RELEASE "-O3")
 
 #===============================================================================
 #= Linker Configuration

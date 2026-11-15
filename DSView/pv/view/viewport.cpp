@@ -347,7 +347,16 @@ void Viewport::doPaint()
             }
             else if (_type == TIME_VIEW) {
                 _view.repeat_unshow();
-                paintProgress(p, fore, back);
+
+                // 1PPS measurement: the last complete frame stays on screen
+                // until the next one replaces it, so show the signals instead
+                // of the progress page. The progress page only stays when there
+                // is nothing to keep yet (first frame of the run).
+                if (_view.session().keep_view_on_capture()
+                        && _view.session().have_view_data())
+                    paintSignals(p, fore, back);
+                else
+                    paintProgress(p, fore, back);
             }
         }     
     }
@@ -1002,6 +1011,11 @@ void Viewport:: mouseMoveEvent(QMouseEvent *event)
 
                         for (auto xc : xcursor_list) {
                             if (xc->grabbed() != XCursor::XCur_None) {
+                                // get_view_rect() is empty before the widget is laid
+                                // out; dividing by that gave inf/NaN and the cursor
+                                // value went straight into the paint code.
+                                const int xrect_w = max(xrect.width(), 1);
+                                const int xrect_h = max(xrect.height(), 1);
                                 if (xc->grabbed() == XCursor::XCur_Y) {
                                     int hover_x = _view.hover_point().x();
 
@@ -1012,7 +1026,7 @@ void Viewport:: mouseMoveEvent(QMouseEvent *event)
                                         hover_x = xrect.right();
                                     }
 
-                                    double rate = (hover_x - xrect.left()) * 1.0 / xrect.width();                                    
+                                    double rate = (hover_x - xrect.left()) * 1.0 / xrect_w;
                                     xc->set_value(xc->grabbed(), min(rate, 1.0));
                                 }
                                 else {
@@ -1021,7 +1035,7 @@ void Viewport:: mouseMoveEvent(QMouseEvent *event)
                                     if (msy > body_y)
                                         msy = body_y;
                                      
-                                    double rate = (msy - xrect.top()) * 1.0 / xrect.height();
+                                    double rate = (msy - xrect.top()) * 1.0 / xrect_h;
                                     xc->set_value(xc->grabbed(), max(rate, 0.0));
                                 }
                                 _xcurs_moved = true;
@@ -1093,7 +1107,13 @@ void Viewport::onLogicMouseRelease(QMouseEvent *event)
                 }
 
                 if (_action_type == NO_ACTION && quickScroll) {
-                    const double strength = _drag_strength*DragTimerInterval*1.0/_elapsed_time.elapsed();
+                    // QElapsedTimer has millisecond resolution on Windows, so a
+                    // move event that lands in the same millisecond as the press
+                    // makes elapsed() return 0 and divided the drag strength into
+                    // inf, which then started an inertial scroll with a garbage
+                    // strength. Clamp to 1 ms: the intended value at that instant.
+                    const double strength = _drag_strength*DragTimerInterval*1.0
+                        / max<qint64>(_elapsed_time.elapsed(), 1);
                     if (_elapsed_time.elapsed() < 200 &&
                         abs(_drag_strength) < MinorDragOffsetUp &&
                         abs(strength) > MinorDragRateUp) {
@@ -1175,7 +1195,8 @@ void Viewport::onLogicMouseRelease(QMouseEvent *event)
                 set_action(NO_ACTION);
             }
             else {
-                const double strength = _drag_strength*DragTimerInterval*1.0/_elapsed_time.elapsed();
+                const double strength = _drag_strength*DragTimerInterval*1.0
+                    / max<qint64>(_elapsed_time.elapsed(), 1);
                 if (_elapsed_time.elapsed() < 200 &&
                     abs(_drag_strength) < MinorDragOffsetUp &&
                     abs(strength) > MinorDragRateUp) {
@@ -1921,7 +1942,10 @@ void Viewport::paintMeasure(QPainter &p, QColor fore, QColor back)
                                _view.get_view_width(), _dso_ym_end);
 
                     // -- vertical delta value
-                    double hrate = (_dso_ym_start - _dso_ym_end) * 1.0f / _view.get_view_height();
+                    // A viewport that has not been laid out yet reports height 0,
+                    // and the delta then divided into inf and printed "inf mV".
+                    const int view_height = max(_view.get_view_height(), 1);
+                    double hrate = (_dso_ym_start - _dso_ym_end) * 1.0f / view_height;
                     double value = hrate  * dsoSig->get_vDialValue() * dsoSig->get_factor() * DS_CONF_DSO_VDIVS;
                     QString value_str = abs(value) > 1000 ? QString::number(value/1000.0, 'f', 2) + "V" : QString::number(value, 'f', 2) + "mV";
                     int value_rect_width = p.boundingRect(0, 0, INT_MAX, INT_MAX,
@@ -2001,7 +2025,12 @@ void Viewport::paintMeasure(QPainter &p, QColor fore, QColor back)
                            x[2], _dso_xm_y + 40);
             _mm_period = _view.get_ruler()->format_real_time(_dso_xm_index[2] - _dso_xm_index[0], sample_rate);
             _mm_freq = _view.get_ruler()->format_real_freq(_dso_xm_index[2] - _dso_xm_index[0], sample_rate);
-            _mm_duty = QString::number((_dso_xm_index[1] - _dso_xm_index[0]) * 100.0 / (_dso_xm_index[2] - _dso_xm_index[0]), 'f', 2)+"%";
+            // Two of the three markers can land on the same pixel index, which
+            // made the period denominator 0 and printed "D=inf%" / "D=-nan%".
+            const uint64_t xm_period = _dso_xm_index[2] - _dso_xm_index[0];
+            _mm_duty = xm_period
+                ? QString::number((_dso_xm_index[1] - _dso_xm_index[0]) * 100.0 / xm_period, 'f', 2)+"%"
+                : QString("--");
 
             // -- period show
             const QString p_ctr = "P="+_mm_period;

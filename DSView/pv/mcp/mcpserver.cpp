@@ -8,6 +8,7 @@
 #include <QTcpSocket>
 #include <QEventLoop>
 #include <QHostAddress>
+#include <QPointer>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -222,7 +223,8 @@ McpServer::McpServer(QObject *parent) :
 	_session(nullptr),
 	_view(nullptr),
 	_data_getter(nullptr),
-	_pps(nullptr)
+	_pps(nullptr),
+	_console(nullptr)
 {
 	connect(_server, &QTcpServer::newConnection,
 		this, &McpServer::on_new_connection);
@@ -250,111 +252,213 @@ void McpServer::on_new_connection()
 void McpServer::on_disconnected()
 {
 	QTcpSocket *sock = qobject_cast<QTcpSocket *>(sender());
-	if (sock)
+	if (sock) {
 		_buffers.remove(sock);
+		sock->deleteLater();
+	}
 }
+
+// Upper bound for one request (headers + body). write_script carries a whole
+// decoder file, which is far below this.
+static const int kMaxRequestBytes = 16 * 1024 * 1024;
 
 void McpServer::on_ready_read()
 {
 	QTcpSocket *sock = qobject_cast<QTcpSocket *>(sender());
-	if (!sock)
+	if (!sock || !_buffers.contains(sock))
 		return;
 
-	_buffers[sock].append(sock->readAll());
-	drain_socket(sock);
+	{
+		QByteArray &buf = _buffers[sock];
+		buf.append(sock->readAll());
+		if (buf.size() > kMaxRequestBytes) {
+			// abort() emits disconnected(), which drops the buffer.
+			sock->abort();
+			return;
+		}
+	}
+
+	if (_draining)
+		return;
+	_draining = true;
+
+	// Requests of other connections may have been buffered while a tool of
+	// this one sat in a nested event loop, so go round until nothing is left.
+	bool progress = true;
+	while (progress) {
+		progress = false;
+		const QList<QTcpSocket *> socks = _buffers.keys();
+		for (QTcpSocket *s : socks) {
+			while (_buffers.contains(s) && process_one(s))
+				progress = true;
+		}
+	}
+	_draining = false;
 }
 
-void McpServer::drain_socket(QTcpSocket *sock)
+// "host", "host:port" or "[v6]:port" naming this machine's loopback.
+static bool is_loopback_host(QByteArray host)
 {
-	QByteArray &buf = _buffers[sock];
+	host = host.trimmed().toLower();
+	if (host.startsWith('[')) {
+		const int end = host.indexOf(']');
+		return end > 0 && host.mid(1, end - 1) == "::1";
+	}
+	const int colon = host.indexOf(':');
+	if (colon >= 0)
+		host.truncate(colon);
+	return host == "127.0.0.1" || host == "localhost";
+}
 
-	for (;;) {
-		int header_end = buf.indexOf("\r\n\r\n");
+static bool is_loopback_origin(const QByteArray &origin)
+{
+	const QByteArray o = origin.trimmed().toLower();
+	QByteArray rest;
+	if (o.startsWith("http://"))
+		rest = o.mid(7);
+	else if (o.startsWith("https://"))
+		rest = o.mid(8);
+	else
+		return false;
+	const int slash = rest.indexOf('/');
+	if (slash >= 0)
+		rest.truncate(slash);
+	return is_loopback_host(rest);
+}
+
+bool McpServer::process_one(QTcpSocket *sock)
+{
+	QByteArray body;
+	QByteArray method, target;
+	QHash<QByteArray, QByteArray> headers;
+
+	auto send = [sock](int status, const QByteArray &reason,
+			const QByteArray &resp_body, bool keep_alive) {
+		QByteArray resp("HTTP/1.1 ");
+		resp.append(QByteArray::number(status)).append(' ')
+			.append(reason).append("\r\n");
+		resp.append("Content-Type: application/json; charset=utf-8\r\n");
+		resp.append("Content-Length: ")
+			.append(QByteArray::number(resp_body.size()))
+			.append("\r\n");
+		resp.append(keep_alive ? "Connection: keep-alive\r\n\r\n"
+				: "Connection: close\r\n\r\n");
+		resp.append(resp_body);
+		sock->write(resp);
+		// A rejected request leaves the stream in an unknown state: answer
+		// and hang up (disconnected() then drops the buffer).
+		if (!keep_alive)
+			sock->disconnectFromHost();
+	};
+
+	{
+		// The reference is only valid inside this block: dispatching below can
+		// run a nested event loop in which the socket goes away.
+		QByteArray &buf = _buffers[sock];
+
+		const int header_end = buf.indexOf("\r\n\r\n");
 		if (header_end < 0)
-			return;
+			return false;
 
-		const QByteArray raw_header = buf.left(header_end);
-		const QList<QByteArray> header_lines = raw_header.split('\n');
-		if (header_lines.isEmpty()) {
-			buf.remove(0, header_end + 4);
-			continue;
-		}
-
+		const QList<QByteArray> header_lines =
+				buf.left(header_end).split('\n');
 		const QList<QByteArray> request_line =
-				header_lines.first().split(' ');
+				header_lines.first().trimmed().split(' ');
 		if (request_line.size() < 3) {
-			buf.remove(0, header_end + 4);
-			continue;
+			buf.clear();
+			send(400, "Bad Request", QByteArray(), false);
+			return false;
 		}
+		method = request_line[0];
+		target = request_line[1];
 
-		const QByteArray method = request_line[0];
-		const QByteArray target = request_line[1];
-
-		int content_length = 0;
 		for (int i = 1; i < header_lines.size(); ++i) {
 			const int colon = header_lines[i].indexOf(':');
 			if (colon <= 0)
 				continue;
-			const QByteArray key =
-					header_lines[i].left(colon).trimmed().toLower();
-			if (key == "content-length")
-				content_length = header_lines[i].mid(colon + 1)
-						.trimmed().toInt();
+			headers.insert(header_lines[i].left(colon).trimmed().toLower(),
+					header_lines[i].mid(colon + 1).trimmed());
+		}
+
+		int content_length = 0;
+		if (headers.contains("content-length")) {
+			bool ok = false;
+			content_length = headers.value("content-length").toInt(&ok);
+			// A negative length used to consume nothing and spin forever.
+			if (!ok || content_length < 0 ||
+					content_length > kMaxRequestBytes) {
+				buf.clear();
+				send(400, "Bad Request", QByteArray(), false);
+				return false;
+			}
 		}
 
 		const int body_start = header_end + 4;
-		if (buf.size() < body_start + content_length)
-			return; // wait for the rest of the body
+		if (buf.size() - body_start < content_length)
+			return false; // wait for the rest of the body
 
-		const QByteArray body = buf.mid(body_start, content_length);
+		body = buf.mid(body_start, content_length);
 		buf.remove(0, body_start + content_length);
-
-		auto send = [&](int status, const QByteArray &reason,
-				const QByteArray &resp_body, bool empty) {
-			QByteArray resp("HTTP/1.1 ");
-			resp.append(QByteArray::number(status)).append(' ')
-				.append(reason).append("\r\n");
-			resp.append("Content-Type: application/json; charset=utf-8\r\n");
-			resp.append("Content-Length: ")
-				.append(QByteArray::number(empty ? 0 : resp_body.size()))
-				.append("\r\n");
-			resp.append("Connection: keep-alive\r\n\r\n");
-			if (!empty)
-				resp.append(resp_body);
-			sock->write(resp);
-		};
-
-		if (method != "POST" || !target.startsWith("/mcp")) {
-			send(404, "Not Found", QByteArray(), true);
-			continue;
-		}
-
-		bool notification = false;
-		QByteArray result;
-		const QJsonDocument doc = QJsonDocument::fromJson(body);
-		if (doc.isObject()) {
-			result = handle_payload(body, notification);
-		} else if (doc.isArray()) {
-			QJsonArray batch;
-			for (const QJsonValue &v : doc.array()) {
-				QJsonObject one =
-						dispatch(v.toObject(), notification);
-				if (!one.isEmpty())
-					batch.append(one);
-			}
-			result = QJsonDocument(batch).toJson(
-					QJsonDocument::Compact);
-			notification = false;
-		} else {
-			send(400, "Bad Request", QByteArray(), true);
-			continue;
-		}
-
-		if (notification)
-			send(202, "Accepted", QByteArray(), true);
-		else
-			send(200, "OK", result, false);
 	}
+
+	if (method != "POST" || !target.startsWith("/mcp")) {
+		send(404, "Not Found", QByteArray(), true);
+		return true;
+	}
+
+	// Listening on loopback keeps other machines out, but not a web page in
+	// the user's browser: it can POST to 127.0.0.1 (directly or through DNS
+	// rebinding) and the tools here write decoder scripts that the embedded
+	// Python then runs. A real MCP client sends JSON, names this host, and
+	// either has no Origin or a loopback one.
+	if (headers.contains("host") && !is_loopback_host(headers.value("host"))) {
+		send(403, "Forbidden", QByteArray(), false);
+		return false;
+	}
+	if (headers.contains("origin") &&
+			!is_loopback_origin(headers.value("origin"))) {
+		send(403, "Forbidden", QByteArray(), false);
+		return false;
+	}
+	if (!headers.value("content-type").toLower()
+			.startsWith("application/json")) {
+		send(415, "Unsupported Media Type", QByteArray(), false);
+		return false;
+	}
+
+	const QPointer<QTcpSocket> alive(sock);
+	bool notification = false;
+	bool bad_request = false;
+	QByteArray result;
+	const QJsonDocument doc = QJsonDocument::fromJson(body);
+	if (doc.isObject()) {
+		result = handle_payload(body, notification);
+	} else if (doc.isArray()) {
+		QJsonArray batch;
+		for (const QJsonValue &v : doc.array()) {
+			QJsonObject one =
+					dispatch(v.toObject(), notification);
+			if (!one.isEmpty())
+				batch.append(one);
+		}
+		result = QJsonDocument(batch).toJson(
+				QJsonDocument::Compact);
+		notification = false;
+	} else {
+		bad_request = true;
+	}
+
+	// The client may have hung up while the tool was running.
+	if (alive.isNull() || !_buffers.contains(sock))
+		return false;
+
+	if (bad_request)
+		send(400, "Bad Request", QByteArray(), true);
+	else if (notification)
+		send(202, "Accepted", QByteArray(), true);
+	else
+		send(200, "OK", result, true);
+	return true;
 }
 
 QByteArray McpServer::handle_payload(const QByteArray &payload,
@@ -730,17 +834,25 @@ static QJsonValue gv_to_json(GVariant *v)
 	// Maybe / container: unwrap or fall back to its printed form.
 	if (g_variant_type_is_maybe(g_variant_get_type(v))) {
 		GVariant *child = g_variant_get_maybe(v);
-		if (child)
-			return gv_to_json(child);
-		return QJsonValue();
+		if (!child)
+			return QJsonValue();
+		const QJsonValue j = gv_to_json(child);
+		g_variant_unref(child);
+		return j;
 	}
 
 	GVariant *scalar = g_variant_is_of_type(v, G_VARIANT_TYPE_VARIANT)
 			? g_variant_get_variant(v) : NULL;
-	if (scalar)
-		return gv_to_json(scalar);
+	if (scalar) {
+		const QJsonValue j = gv_to_json(scalar);
+		g_variant_unref(scalar);
+		return j;
+	}
 
-	return QString::fromUtf8(g_variant_print(v, NULL));
+	gchar *printed = g_variant_print(v, FALSE);
+	const QString text = QString::fromUtf8(printed ? printed : "");
+	g_free(printed);
+	return text;
 }
 
 // Build a GVariant of the same type as ref_type from a JSON value.
@@ -793,6 +905,9 @@ QJsonObject McpServer::tool_get_device_info(const QJsonObject &)
 
 QJsonObject McpServer::tool_start_capture(const QJsonObject &args)
 {
+	if (_pps && _pps->pps_is_running())
+		return text_result("The 1PPS measurement owns the capture; "
+				"call stop_pps first.", true);
 	const bool instant = args.value("instant").toBool(false);
 	const bool ok = _session->start_capture(instant);
 	return text_result(ok ? "Capture started." : "Failed to start capture.",
@@ -801,6 +916,9 @@ QJsonObject McpServer::tool_start_capture(const QJsonObject &args)
 
 QJsonObject McpServer::tool_stop_capture(const QJsonObject &)
 {
+	if (_pps && _pps->pps_is_running())
+		return text_result("The 1PPS measurement owns the capture; "
+				"call stop_pps first.", true);
 	// Stop on an idle session is a no-op, not a failure: report success so
 	// clients can call stop unconditionally in a cleanup path.
 	if (!_session->is_working())
@@ -817,6 +935,8 @@ QJsonObject McpServer::tool_set_collect_mode(const QJsonObject &args)
 	if (mode < 0 || mode > 2)
 		return text_result("Invalid mode; use 0=single, 1=repeat, 2=loop.",
 				true);
+	if (_session->is_working())
+		return text_result("A capture is running; stop it first.", true);
 	_session->set_collect_mode(static_cast<DEVICE_COLLECT_MODE>(mode));
 	return text_result("Collect mode set to " + QString::number(mode));
 }
@@ -843,6 +963,8 @@ QJsonObject McpServer::tool_set_channel_enabled(const QJsonObject &args)
 	DeviceAgent *dev = _session->get_device();
 	const int index = args.value("index").toInt(-1);
 	const bool enabled = args.value("enabled").toBool();
+	if (_session->is_working())
+		return text_result("A capture is running; stop it first.", true);
 	const sr_channel *target = NULL;
 	for (GSList *l = dev->get_channels(); l; l = l->next) {
 		const sr_channel *ch = static_cast<const sr_channel *>(l->data);
@@ -861,6 +983,15 @@ QJsonObject McpServer::tool_set_channel_name(const QJsonObject &args)
 	DeviceAgent *dev = _session->get_device();
 	const int index = args.value("index").toInt(-1);
 	const QString name = args.value("name").toString();
+	// The name is written into the line-oriented .dsl header as
+	// "probe<n> = <name>"; a control character there would end the line early and
+	// inject a second header key when the file is reopened.
+	for (int i = 0; i < name.size(); i++) {
+		const ushort c = name.at(i).unicode();
+		if (c < 0x20 || c == 0x7f)
+			return text_result("Channel name must not contain control characters "
+					"(newline, tab, ...).", true);
+	}
 	const bool ok = dev->set_channel_name(index, name.toUtf8().constData());
 	return text_result(ok ? "Channel renamed." : "Failed to rename channel.",
 			!ok);
@@ -870,6 +1001,8 @@ QJsonObject McpServer::tool_set_sample_config(const QJsonObject &args)
 {
 	DeviceAgent *dev = _session->get_device();
 	QStringList done;
+	if (_session->is_working())
+		return text_result("A capture is running; stop it first.", true);
 
 	if (args.contains("sample_rate")) {
 		const uint64_t rate = args.value("sample_rate")
@@ -983,6 +1116,8 @@ QJsonObject McpServer::tool_remove_decoder(const QJsonObject &args)
 	const int index = args.value("index").toInt(-1);
 	if (index < 0)
 		return text_result("Missing index.", true);
+	if (index >= static_cast<int>(_session->get_decode_signals().size()))
+		return text_result("Decoder index out of range.", true);
 	_session->remove_decoder(index);
 	return text_result("Removed decoder at index " + QString::number(index));
 }
@@ -992,6 +1127,8 @@ QJsonObject McpServer::tool_reset_decoder(const QJsonObject &args)
 	const int index = args.value("index").toInt(-1);
 	if (index < 0)
 		return text_result("Missing index.", true);
+	if (index >= static_cast<int>(_session->get_decode_signals().size()))
+		return text_result("Decoder index out of range.", true);
 	// Re-run decoding without the modal options dialog that rst_decoder opens.
 	_session->re_decode_trace(index);
 	return text_result("Reset decoder at index " + QString::number(index));
@@ -1112,6 +1249,8 @@ QJsonObject McpServer::tool_set_decoder_option(const QJsonObject &args)
 		return text_result("Decoder trace not found.", true);
 
 	data::DecoderStack *stack = trace->decoder();
+	if (stack->stack().empty())
+		return text_result("Decoder trace has no decoder.", true);
 	data::decode::Decoder *target = stack->stack().front();
 	const GVariantType *ref_type = NULL;
 	for (auto dec : stack->stack()) {

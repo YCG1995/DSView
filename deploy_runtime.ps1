@@ -28,6 +28,13 @@ if (-not (Test-Path -LiteralPath $Target -PathType Container)) {
     throw "目标目录不存在（先编译一次生成 build.dir）: $Target"
 }
 
+# 模板和目标是同一个目录时等于自己拷自己，Copy-Item 会报错或留下半截状态
+$templateFull = (Resolve-Path -LiteralPath $Template).ProviderPath.TrimEnd('', '/')
+$targetFull = (Resolve-Path -LiteralPath $Target).ProviderPath.TrimEnd('', '/')
+if ($templateFull -ieq $targetFull) {
+    throw "模板目录不能就是目标目录: $targetFull（先把它拷到别处再当模板）"
+}
+
 $skipNames = @('autosave', 'DSView.exe', 'dlls.txt', 'tmp_old.exe')
 $skipExt = @('.md', '.txt')
 
@@ -41,8 +48,10 @@ foreach ($item in Get-ChildItem -LiteralPath $Template -Force) {
     $dest = Join-Path $Target $item.Name
     if ($item.PSIsContainer) {
         Copy-Item -LiteralPath $item.FullName -Destination $Target -Recurse -Force
-        $bytes += (Get-ChildItem -LiteralPath $dest -Recurse -File | Measure-Object -Property Length -Sum).Sum
-        $copied += (Get-ChildItem -LiteralPath $dest -Recurse -File | Measure-Object).Count
+        # 按模板里的文件统计：目标目录里原有的文件不算进"本次复制"
+        $srcFiles = @(Get-ChildItem -LiteralPath $item.FullName -Recurse -File -Force)
+        $bytes += ($srcFiles | Measure-Object -Property Length -Sum).Sum
+        $copied += $srcFiles.Count
     }
     else {
         Copy-Item -LiteralPath $item.FullName -Destination $dest -Force

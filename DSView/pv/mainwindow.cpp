@@ -899,6 +899,11 @@ namespace pv
         _pps_manager->set_data_getter(this);
         connect(_pps_manager, &pps::PpsManager::status_message,
                 this, &MainWindow::on_pps_status);
+        // The manager puts the channel mode back first (possibly a moment
+        // after stop(), once the capture has unwound); the user's own channel
+        // selection goes on top of that.
+        connect(_pps_manager, &pps::PpsManager::device_restored,
+                this, &MainWindow::restore_channels_after_pps);
 
         // The calibration coefficient is a property of the analyzer, not of a
         // single session, so it survives restarts.
@@ -936,7 +941,12 @@ namespace pv
     void MainWindow::on_pps_config()
     {
         ensure_pps();
-        dialogs::PpsConfigDlg dlg(_session, _pps_manager->config(), this);
+        // A running measurement is bound to the acquisition settings it started
+        // with (statistics, CSV columns, probes the hardware streams), but the
+        // DSL save policy is read on every frame - so the dialog opens in
+        // "live" mode and only that part is applied.
+        const bool running = _pps_manager->is_running();
+        dialogs::PpsConfigDlg dlg(_session, _pps_manager->config(), running, this);
         // Head-less check hook: DSVIEW_PPS_CONFIG_SHOT=<png> grabs the dialog
         // once it has been laid out, so the layout can be inspected without a
         // person clicking through the menus.
@@ -948,9 +958,19 @@ namespace pv
             });
         }
         if (dlg.exec() == QDialog::Accepted) {
+            if (running) {
+                // Live mode: only the DSL save policy (and the save directory)
+                // reach the manager; the acquisition settings are locked out of
+                // the dialog and stay exactly as the run started with them.
+                _pps_manager->apply_save_options(dlg.result_config());
+                statusBar()->showMessage(QString::fromUtf8(
+                    "1PPS DSL 保存策略已更新（测量继续运行）。"), 6000);
+                return;
+            }
             // set_config() stores the whole setup in QSettings, so the dialog
             // opens with the same values after a restart.
-            _pps_manager->set_config(dlg.result_config());
+            if (!_pps_manager->set_config(dlg.result_config()))
+                return;
             save_channels_before_pps();
             apply_pps_channels_to_session();
         }
@@ -979,7 +999,9 @@ namespace pv
         }
         dsv_info("1PPS config: main capture channels mirrored (%d channel(s))",
             (int)set.size());
-        if (_view)
+        if (!_session->is_working())
+            _session->reload_signals();
+        else if (_view)
             _view->signals_changed(NULL);
     }
 
@@ -1006,6 +1028,10 @@ namespace pv
     {
         if (!_pps_channels_saved || !_session || !_session->get_device())
             return;
+        // The manager still has to put the channel mode back; it reports in
+        // through device_restored() and this runs again then.
+        if (_pps_manager && _pps_manager->restore_pending())
+            return;
 
         DeviceAgent *dev = _session->get_device();
         int enabled = 0;
@@ -1022,8 +1048,24 @@ namespace pv
         }
         _pps_channels_saved = false;
         dsv_info("1PPS: main capture channels restored (%d enabled)", enabled);
-        if (_view)
+        if (!_session->is_working())
+            _session->reload_signals();
+        else if (_view)
             _view->signals_changed(NULL);
+    }
+
+    // 1PPS runs the real device. With a saved .dsl file loaded the session is
+    // backed by a file device instance, start() then reports success and every
+    // frame comes back empty: 494 frames of zeros were dumped to CSV in 18 s with
+    // no error anywhere. Refuse up front instead of measuring nothing.
+    static bool pps_live_device_ok(SigSession *session, QString &error)
+    {
+        if (session && session->get_device() && session->get_device()->is_file()) {
+            error = QString::fromUtf8("1PPS 测量需要连接的真实设备；当前打开的是已保存的"
+                "采集文件，请先在设备菜单里重新连接设备，再开始测量。");
+            return false;
+        }
+        return true;
     }
 
     void MainWindow::on_pps_start()
@@ -1035,6 +1077,15 @@ namespace pv
         if (_pps_manager->is_running()) {
             statusBar()->show();
             statusBar()->showMessage(QString::fromUtf8("1PPS 测量已在运行。"), 5000);
+            return;
+        }
+
+        QString file_error;
+        if (!pps_live_device_ok(_session, file_error)) {
+            statusBar()->show();
+            statusBar()->showMessage(file_error, 8000);
+            QMessageBox::warning(this, QString::fromUtf8("1PPS 测量"), file_error);
+            _pps_result->refresh();
             return;
         }
 
@@ -1119,14 +1170,10 @@ namespace pv
                 dlg.accept();
             });
         }
-        // Calibration rewrites the probe enables as well; the user's own channel
-        // selection has to survive it. The restore is deferred by one event loop
-        // turn because the dialog stops its run in its destructor, which only
-        // happens once this function returns - restoring earlier would hand the
-        // channels back while the calibration is still sampling.
-        save_channels_before_pps();
+        // Calibration rewrites the operation mode, the channel mode and the
+        // probe enables; the run puts all of them back by itself once its last
+        // capture has unwound (PpsCalibration::restore_device).
         dlg.exec();
-        QTimer::singleShot(0, this, [this]() { restore_channels_after_pps(); });
 
         if (dlg.has_result()) {
             const double f = dlg.factor();
@@ -1244,6 +1291,95 @@ namespace pv
         }
     }
 
+    // Keys pps_config_apply() actually understands. Anything else used to be
+    // accepted and silently ignored: a caller that nested the save options under
+    // {"save": {...}} got HTTP 200 with an unchanged configuration and no hint.
+    static QString pps_config_unknown_key(const QJsonObject &o)
+    {
+        static const char *kKeys[] = {
+            "ref_channel", "ref_edge", "trigger_pos_percent", "capture_ms",
+            "sample_rate", "save_dir", "range", "dsl_save_loss",
+            "auto_save_loss", "dsl_save_abnormal", "dsl_save_always",
+            "calib_factor", "channels", "disabled"
+        };
+        for (const QString &key : o.keys()) {
+            bool known = false;
+            for (const char *k : kKeys) {
+                if (key == QLatin1String(k)) { known = true; break; }
+            }
+            if (!known)
+                return key;
+        }
+        return QString();
+    }
+
+    // `channels` entries are objects with exactly ch / edge / save, and
+    // `disabled` is a list of channel numbers. Both used to be read with
+    // QJsonValue::toInt(), which returns 0 for a missing or mistyped member: a
+    // caller that spelled the channel key differently ({"index": 3}) got every
+    // test channel silently mapped onto ch0 (the run then reported a flat 0 ns
+    // delta and no error at all), and a non-numeric `disabled` entry disabled
+    // channel 0. Reject the request instead of guessing.
+    static QString pps_config_channels_error(const QJsonObject &cfg, int channel_num)
+    {
+        const QString bad_channel_key =
+            QString::fromUtf8("channels[%1] %2");
+
+        if (cfg.contains("channels")) {
+            if (!cfg.value("channels").isArray())
+                return QString::fromUtf8("channels 必须是数组。");
+            const QJsonArray arr = cfg.value("channels").toArray();
+            QList<int> seen;
+            for (int i = 0; i < arr.size(); ++i) {
+                if (!arr.at(i).isObject())
+                    return bad_channel_key.arg(i)
+                        .arg(QString::fromUtf8("必须是对象"
+                            "（{\"ch\":n,\"edge\":0|1,\"save\":true|false}）。"));
+                const QJsonObject c = arr.at(i).toObject();
+                for (const QString &k : c.keys()) {
+                    if (k == QLatin1String("ch") || k == QLatin1String("edge")
+                            || k == QLatin1String("save"))
+                        continue;
+                    return QString::fromUtf8("未知的 channel 字段：")
+                        + k + QString::fromUtf8("（channels[%1] 只接受 ch / edge / save）")
+                            .arg(i);
+                }
+                if (!c.value("ch").isDouble())
+                    return bad_channel_key.arg(i)
+                        .arg(QString::fromUtf8("缺少通道号 ch。"));
+                if (c.contains("edge") && !c.value("edge").isDouble())
+                    return bad_channel_key.arg(i)
+                        .arg(QString::fromUtf8("的 edge 必须是 0（上升沿）或 1（下降沿）。"));
+                if (c.contains("save") && !c.value("save").isBool())
+                    return bad_channel_key.arg(i)
+                        .arg(QString::fromUtf8("的 save 必须是 true 或 false。"));
+                const int ch = c.value("ch").toInt(-1);
+                if (ch < 0 || (channel_num > 0 && ch >= channel_num))
+                    return bad_channel_key.arg(i)
+                        .arg(QString::fromUtf8("的通道号 %1 超出设备可用的 %2 个通道。")
+                            .arg(ch).arg(channel_num));
+                if (seen.contains(ch))
+                    return QString::fromUtf8("channels 里通道 %1 重复。").arg(ch);
+                seen << ch;
+            }
+        }
+
+        if (cfg.contains("disabled")) {
+            if (!cfg.value("disabled").isArray())
+                return QString::fromUtf8("disabled 必须是通道号数组。");
+            const QJsonArray arr = cfg.value("disabled").toArray();
+            for (int i = 0; i < arr.size(); ++i) {
+                if (!arr.at(i).isDouble())
+                    return QString::fromUtf8("disabled[%1] 必须是通道号。").arg(i);
+                const int ch = arr.at(i).toInt(-1);
+                if (ch < 0 || (channel_num > 0 && ch >= channel_num))
+                    return QString::fromUtf8("disabled[%1] 的通道号 %2 超出设备可用的 %3 个通道。")
+                        .arg(i).arg(ch).arg(channel_num);
+            }
+        }
+        return QString();
+    }
+
     QJsonObject MainWindow::pps_describe()
     {
         ensure_pps();
@@ -1288,8 +1424,80 @@ namespace pv
     {
         ensure_pps();
 
+        int channel_num = 0;
+        pps::PpsDeviceCaps caps;
+        if (pps::query_device_caps(_session, caps))
+            channel_num = caps.channel_num;
+        const QString channels_error = pps_config_channels_error(cfg, channel_num);
+        if (!channels_error.isEmpty()) {
+            error = channels_error;
+            return false;
+        }
+
         if (_pps_manager->is_running()) {
-            error = QString::fromUtf8("1PPS 正在运行，请先调用 stop_pps 再修改配置。");
+            // Same rule as the dialog in live mode: the DSL save policy is read
+            // per frame, everything else belongs to the acquisition that is
+            // already streaming.
+            static const char *kLiveKeys[] = {
+                "dsl_save_loss", "dsl_save_abnormal", "dsl_save_always",
+                "auto_save_loss", "channels"
+            };
+            for (const QString &key : cfg.keys()) {
+                bool live = false;
+                for (const char *k : kLiveKeys) {
+                    if (key == QLatin1String(k)) {
+                        live = true;
+                        break;
+                    }
+                }
+                if (!live) {
+                    error = QString::fromUtf8("1PPS 正在运行，只能修改 DSL 保存"
+                        "相关字段（dsl_save_loss / dsl_save_abnormal / "
+                        "dsl_save_always / channels），其余请先 stop_pps。"
+                        "保存目录改了会和本次 CSV 分到两个目录，因此运行中"
+                        "也锁定。");
+                    return false;
+                }
+            }
+            pps::PpsConfig live_cfg = _pps_manager->config();
+            // `channels` is accepted live only as the carrier of the per-channel
+            // DSL save flag. The channel set and the edge direction belong to
+            // the acquisition that is already streaming: applying them would be
+            // a silent no-op (apply_save_options() keeps only the save flag),
+            // so a request that changes them is refused instead of answered
+            // with success.
+            if (cfg.contains("channels")) {
+                const QJsonArray arr = cfg.value("channels").toArray();
+                if (static_cast<size_t>(arr.size()) != live_cfg.channels.size()) {
+                    error = QString::fromUtf8("1PPS 正在运行，测试通道集合不能修改"
+                        "（channels 的数量与当前运行不一致）；请先 stop_pps。");
+                    return false;
+                }
+                for (size_t i = 0; i < live_cfg.channels.size(); ++i) {
+                    const QJsonObject c = arr.at(static_cast<int>(i)).toObject();
+                    if (c.value("ch").toInt(-1) != live_cfg.channels[i].channel_index) {
+                        error = QString::fromUtf8("1PPS 正在运行，测试通道集合不能修改"
+                            "（channels 的通道号与当前运行不一致）；请先 stop_pps。");
+                        return false;
+                    }
+                    if (c.contains("edge") &&
+                            c.value("edge").toInt(live_cfg.channels[i].edge)
+                                != live_cfg.channels[i].edge) {
+                        error = QString::fromUtf8("1PPS 正在运行，通道边沿方向不能修改"
+                            "；请先 stop_pps。");
+                        return false;
+                    }
+                }
+            }
+            pps_config_apply(cfg, live_cfg);
+            _pps_manager->apply_save_options(live_cfg);
+            return true;
+        }
+
+        const QString unknown = pps_config_unknown_key(cfg);
+        if (!unknown.isEmpty()) {
+            error = QString::fromUtf8("未知的 1PPS 配置字段：%1"
+                "（可用字段与 get_pps_config 返回的 config 键一致）").arg(unknown);
             return false;
         }
 
@@ -1319,6 +1527,13 @@ namespace pv
             return false;
         }
 
+        QString file_error;
+        if (!pps_live_device_ok(_session, file_error)) {
+            error = file_error;
+            _pps_result->refresh();
+            return false;
+        }
+
         // Unlike on_pps_start() this never opens a modal box: an MCP client
         // gets the failure text instead of a dialog it cannot dismiss.
         save_channels_before_pps();
@@ -1333,6 +1548,11 @@ namespace pv
 
         _pps_result->refresh();
         return true;
+    }
+
+    bool MainWindow::pps_is_running()
+    {
+        return _pps_manager && _pps_manager->is_running();
     }
 
     void MainWindow::pps_stop()
@@ -1361,6 +1581,7 @@ namespace pv
         out["csv_path"] = _pps_manager->csv_path();
         out["last_capture_ms"] = _pps_manager->last_capture_ms();
         out["last_report_ms"] = _pps_manager->last_report_ms();
+        out["last_save_ms"] = _pps_manager->last_save_ms();
         out["last_total_ms"] = _pps_manager->last_total_ms();
 
         QJsonArray results;
@@ -2426,6 +2647,11 @@ namespace pv
 
     void MainWindow::show_wait_trigger()
     {
+        // During a 1PPS run the previous frame stays on screen until the next
+        // one is complete, so the "waiting for trigger" overlay must not be
+        // drawn between two frames - it would hide exactly that waveform.
+        if (_pps_manager && _pps_manager->is_running())
+            return;
         _view->show_wait_trigger();
     }
 

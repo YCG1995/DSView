@@ -8,6 +8,7 @@
 #define DSVIEW_PV_PPS_PPSDECODER_H
 
 #include <stdint.h>
+#include <map>
 #include <vector>
 #include <QString>
 
@@ -51,6 +52,11 @@ class PpsDecoder
 public:
     PpsDecoder();
 
+    // Coarse-step state is learned across frames (first pass sample by sample,
+    // later passes from the measured pulse width), so one decoder instance is
+    // kept for a whole run. reset_steps() puts every channel back to step 1.
+    void reset_steps();
+
     // Decode one captured frame.
     // snapshot          : completed logic snapshot for the frame
     // sample_count      : number of samples in the frame
@@ -80,7 +86,8 @@ public:
             int wanted_edge,
             uint64_t sample_count,
             std::vector<uint64_t> &edges,
-            uint64_t max_edges = 0);
+            uint64_t max_edges = 0,
+            uint64_t step = 64);
 
 private:
     // Find the nearest edge of the requested direction for one channel.
@@ -91,7 +98,15 @@ private:
             int wanted_edge,
             uint64_t t0,
             uint64_t sample_count,
+            uint64_t step,
             uint64_t &edge_sample);
+
+    uint64_t step_for(int channel_index) const;
+
+    // Samples between coarse probes, per channel, learned from the first pass.
+    std::map<int, uint64_t> _steps;
+    // Channels that already had their sample-by-sample pass in this run.
+    std::map<int, bool> _measured;
 };
 
 } // namespace pps

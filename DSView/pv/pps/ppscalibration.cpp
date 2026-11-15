@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <QTimer>
 #include <QMetaObject>
+#include <QCoreApplication>
 
 using std::vector;
 
@@ -35,6 +36,44 @@ static const int kMaxAttemptsPerCapture = 40;
 
 // Number of calibration runs that currently own the hardware trigger.
 static int s_active_runs = 0;
+
+// Device setup waiting to be put back. The run object usually belongs to a
+// dialog and is gone before a capture that is still unwinding lets go of the
+// device, so the pending state lives here and is restored from the
+// application's event loop.
+static PpsDeviceState s_pending_restore;
+static int s_pending_gen = 0;
+
+static void restore_when_idle(SigSession *session, int gen, int retries)
+{
+	if (gen != s_pending_gen || !s_pending_restore.valid || session == nullptr)
+		return;
+	DeviceAgent *dev = session->get_device();
+	if (dev == nullptr) {
+		s_pending_restore = PpsDeviceState();
+		return;
+	}
+	// Switching the mode rebuilds the probe list, so wait for the capture to
+	// be really over (10 s at most) - and never touch the device while a 1PPS
+	// measurement owns it: reprogramming the mode and the probes under a live
+	// capture breaks the frame the measurement is decoding. That wait has no
+	// retry cap; the measurement ends by itself, and its own restore puts back
+	// the same snapshot this one would (take_pending_state()).
+	const bool measuring = PpsManager::any_running();
+	if (measuring || (session->is_working() && retries < 50)) {
+		QTimer::singleShot(200, qApp, [session, gen, retries]() {
+			restore_when_idle(session, gen, retries + 1);
+		});
+		return;
+	}
+	// Samplerate and depth are left alone, the same rule the measurement
+	// follows: the session tracks them and re-applies its own on the next
+	// capture.
+	s_pending_restore.restore(dev, false);
+	s_pending_restore = PpsDeviceState();
+	session->reload_signals();
+	dsv_info("1PPS calib: device setup restored");
+}
 
 PpsCalibConfig::PpsCalibConfig()
 	: channel(0)
@@ -110,6 +149,33 @@ bool PpsCalibration::any_active()
 	return s_active_runs > 0;
 }
 
+bool PpsCalibration::take_pending_state(PpsDeviceState *out)
+{
+	if (out == nullptr || !s_pending_restore.valid)
+		return false;
+	*out = s_pending_restore;
+	s_pending_restore = PpsDeviceState();
+	// Cancel the deferred restore that is still queued for this snapshot.
+	++s_pending_gen;
+	return true;
+}
+
+void PpsCalibration::restore_device()
+{
+	if (!_dev_backup.valid)
+		return;
+	s_pending_restore = _dev_backup;
+	_dev_backup = PpsDeviceState();
+	// Never from inside the capture-end handler this is usually called from:
+	// reprogramming the device while the finish message is still being
+	// delivered is what crashed the stream path before.
+	SigSession *session = _session;
+	const int gen = ++s_pending_gen;
+	QTimer::singleShot(100, qApp, [session, gen]() {
+		restore_when_idle(session, gen, 0);
+	});
+}
+
 bool PpsCalibration::start(const PpsCalibConfig &cfg)
 {
 	if (_running)
@@ -143,6 +209,7 @@ bool PpsCalibration::start(const PpsCalibConfig &cfg)
 	_widened = false;
 
 	if (!apply_hardware_config()) {
+		restore_device();
 		emit status_message(_error);
 		return false;
 	}
@@ -163,6 +230,8 @@ bool PpsCalibration::start(const PpsCalibConfig &cfg)
 			s_active_runs--;
 			_owns_trigger = false;
 		}
+		ds_trigger_set_en(0);
+		restore_device();
 		_error = QString::fromUtf8("启动校准采集失败。");
 		emit status_message(_error);
 		return false;
@@ -190,6 +259,18 @@ bool PpsCalibration::apply_hardware_config()
 	if (!query_device_caps(_session, caps)) {
 		_error = QString::fromUtf8("无法读取设备的逻辑通道信息，无法校准。");
 		return false;
+	}
+
+	// Everything below overrides the user's setup. A restore that is still
+	// waiting for the previous run's capture holds the real pre-run state.
+	if (!_dev_backup.valid) {
+		if (s_pending_restore.valid) {
+			_dev_backup = s_pending_restore;
+			s_pending_restore = PpsDeviceState();
+			++s_pending_gen;
+		} else {
+			_dev_backup.capture(dev);
+		}
 	}
 
 	// Fixed 100MHz: fast enough to time a 10ms or 1PPS interval to a few ppm,
@@ -251,7 +332,10 @@ bool PpsCalibration::apply_hardware_config()
 
 	uint64_t sample_count = static_cast<uint64_t>(
 		rate * _cfg.window_ms / 1000.0);
-	uint64_t depth = caps.hw_depth;
+	// The calibration capture enables exactly one probe, so it may use the whole
+	// device memory: SR_CONF_HW_DEPTH is divided by whichever probes were on when
+	// it was queried, hw_depth_total is not.
+	uint64_t depth = caps.hw_depth_total > 0 ? caps.hw_depth_total : caps.hw_depth;
 	bool stream = false;
 	_stream_mode = false;
 
@@ -406,6 +490,7 @@ void PpsCalibration::stop()
 	ds_trigger_set_en(0);
 	if (_session)
 		_session->stop_capture();
+	restore_device();
 	dsv_info("1PPS calib: stopped after %d capture(s)", _done);
 }
 
@@ -428,6 +513,10 @@ void PpsCalibration::finish_current_capture()
 	const uint64_t sample_count = snap->get_sample_count();
 	const uint64_t sample_rate = _session->cur_samplerate() != 0
 			? _session->cur_samplerate() : _active_rate;
+	// The final result converts the summed periods with _active_rate, so it
+	// has to be the rate the frames were really measured at.
+	if (sample_rate != 0)
+		_active_rate = sample_rate;
 
 	vector<uint64_t> edges;
 	PpsDecoder::find_all_edges(snap, _cfg.channel, PPS_EDGE_RISING,
@@ -501,6 +590,7 @@ void PpsCalibration::restart_capture_now()
 		if (_watchdog)
 			_watchdog->stop();
 		ds_trigger_set_en(0);
+		restore_device();
 		emit failed(_error);
 		return;
 	}
@@ -541,6 +631,7 @@ void PpsCalibration::widen_window_and_restart()
 		if (_watchdog)
 			_watchdog->stop();
 		ds_trigger_set_en(0);
+		restore_device();
 		emit failed(_error);
 		return;
 	}
@@ -558,6 +649,7 @@ void PpsCalibration::widen_window_and_restart()
 		if (_watchdog)
 			_watchdog->stop();
 		ds_trigger_set_en(0);
+		restore_device();
 		emit failed(_error);
 		return;
 	}
@@ -640,12 +732,13 @@ void PpsCalibration::advance_after_capture(bool usable, size_t edges,
 	if (_watchdog)
 		_watchdog->stop();
 	ds_trigger_set_en(0);
+	restore_device();
 
 	if (_usable == 0) {
 		_error = QString::fromUtf8(
-			"校准失败：CH%1 在 %.0f ms 窗口内没有采到两个上升沿。%2"
+			"校准失败：CH%1 在 %2 ms 窗口内没有采到两个上升沿。%3"
 			"请确认信号接到该通道上（10ms 或 1PPS 都可以）。")
-			.arg(_cfg.channel).arg(_cfg.window_ms)
+			.arg(_cfg.channel).arg(_cfg.window_ms, 0, 'f', 0)
 			.arg(_stream_mode
 				? QString::fromUtf8("Stream 模式下帧起点不跟随触发点，"
 					"1PPS 建议把采集时间调到 1800–2000 ms 再试。")

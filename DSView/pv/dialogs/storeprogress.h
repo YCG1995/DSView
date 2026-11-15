@@ -95,6 +95,14 @@ private:
     bool                _is_done;
     QTimer              m_timer;
     QString             _file_path;
+    // show_error() opens a modal message box, which runs its own event loop:
+    // the poll timer and queued progress signals keep being delivered in there,
+    // so a failure would raise one box after another and each nested frame
+    // would reach close() after the inner one already deleted the dialog.
+    bool                _error_reported;
+    // Set right before "delete this", so a repeated closeEvent cannot delete
+    // the object twice.
+    bool                _closing;
 };
 
 } // dialogs

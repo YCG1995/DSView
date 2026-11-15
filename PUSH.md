@@ -47,7 +47,7 @@ pwsh -File .\push_to_github.ps1 -Message "同步：<本次改动摘要>"
 | `-Branch` | 要推送的本地分支，默认 `main` |
 | `-RemoteBranch` | 远程分支，默认 `master` |
 | `-DryRun` | 只打印将要做什么，不提交不推送 |
-| `-AllowDirty` | 允许工作树有未提交改动时继续（一般不要用） |
+| `-AllowDirty` | 允许工作树有未提交改动时继续：改动先 `git stash`，推送完切回原分支后自动 `git stash pop` |
 
 ## 3. 方式 B：手动三步（等价于脚本）
 

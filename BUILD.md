@@ -186,6 +186,8 @@ Get-FileHash -LiteralPath 'D:\AI项目\DSView-master\build.dir\DSView.exe' -Algo
 | 改 qss 后界面没变化 | qrc 在配置期生成 | 重跑配置命令再 `ninja` |
 | `.gitignore` 把 `BUILD.md` 也忽略了 | Windows 下 `build*` 忽略大小写 | `.gitignore` 写 `build/`、`build.dir/`、`build-*/` |
 | CMake 报 policy 版本错误 | 老 CMakeLists + 新 CMake | 加 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` |
+| 配置报 `DSView/config.h.in does not exist`，或编译报 `../config.h: No such file` | `.gitignore` 曾把 `config.h` / `config.h.in` / `version.h` 当生成物忽略，切分支后文件丢失 | 这 6 个文件（`DSView/config.h`、`DSView/config.h.in`、`libsigrok4DSL/{config,version}.h`、`libsigrokdecode4DSL/{config,version}.h`）现在已取消忽略，必须入库；丢了用 `git checkout -- <文件>` 取回 |
+| 链接报 `cannot open output file ...DSView.exe: Permission denied` | `build.dir\DSView.exe` 正在运行 | 关掉 DSView 再 `ninja` |
 
 ## 7. 已含的定制
 

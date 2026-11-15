@@ -1782,26 +1782,59 @@ static int sr_load_virtual_device_session(struct sr_dev_inst *sdi)
                 }
                 else if (!strncmp(keys[j], "probe", 5))
                 {
-                    enabled_probes++;
                     tmp_u64 = strtoul(keys[j] + 5, NULL, 10);
                     /* sr_session_save() */
                     if (version == 1)
                     {
+                        enabled_probes++;
                         sr_dev_probe_name_set(sdi, tmp_u64, val);
                         sr_dev_probe_enable(sdi, tmp_u64, TRUE);
                     }
                     else if (version > 1)
                     {
-                        channel_type = (mode == DSO) ? SR_CHANNEL_DSO : (mode == ANALOG) ? SR_CHANNEL_ANALOG
-                                                                                         : SR_CHANNEL_LOGIC;
-                        if (!(probe = sr_channel_new(tmp_u64, channel_type, TRUE, val)))
-                        {
-                            sr_err("%s: create channel failed", __func__);
-                            sr_dev_inst_free(sdi);
-                            return SR_ERR;
-                        }
+                        /*
+                         * A hand-written / third-party file can repeat a probe
+                         * index (or carry a non-numeric one). Creating a channel
+                         * per key then produced a channel list with two entries
+                         * for the same index, and every consumer that maps index
+                         * to a row picked one of them at random (an 8-channel
+                         * recording opened as 9 channels with two index 5s).
+                         * Keep the first entry for each index and skip the rest.
+                         */
+                        gboolean dup = FALSE;
 
-                        sdi->channels = g_slist_append(sdi->channels, probe);
+                        for (GSList *cl = sdi->channels; cl; cl = cl->next)
+                        {
+                            if (((struct sr_channel *)cl->data)->index == (int)tmp_u64)
+                            {
+                                dup = TRUE;
+                                break;
+                            }
+                        }
+                        if (tmp_u64 >= 1024)
+                        {
+                            sr_warn("%s: ignoring probe index %lu (out of range)",
+                                    __func__, (unsigned long)tmp_u64);
+                        }
+                        else if (dup)
+                        {
+                            sr_warn("%s: ignoring duplicate probe index %lu",
+                                    __func__, (unsigned long)tmp_u64);
+                        }
+                        else
+                        {
+                            channel_type = (mode == DSO) ? SR_CHANNEL_DSO : (mode == ANALOG) ? SR_CHANNEL_ANALOG
+                                                                                             : SR_CHANNEL_LOGIC;
+                            if (!(probe = sr_channel_new(tmp_u64, channel_type, TRUE, val)))
+                            {
+                                sr_err("%s: create channel failed", __func__);
+                                sr_dev_inst_free(sdi);
+                                return SR_ERR;
+                            }
+
+                            enabled_probes++;
+                            sdi->channels = g_slist_append(sdi->channels, probe);
+                        }
                     }
                 }
                 else if (!strncmp(keys[j], "trigger", 7))
