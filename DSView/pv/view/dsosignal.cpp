@@ -1516,15 +1516,17 @@ double DsoSignal::get_voltage(uint64_t index)
 
 QString DsoSignal::get_voltage(double v, int p, bool scaled)
 {
-    if (_vDial == NULL){
-        assert(false);
+    // Every branch below multiplies by _vDial->get_factor() and divides by the
+    // view height; without either of them this produced a division by zero (or
+    // a null dereference) while painting the measure cursors.
+    if (_vDial == NULL || _data == NULL){
+        dsv_err("DsoSignal::get_voltage(), channel %d is not ready.", get_index());
+        return QString("--");
     }
 
     if (get_view_rect().height() == 0){
-        assert(false);
+        return QString("--");
     }
-
-    assert(_data);
 
     uint64_t k = _data->get_measure_voltage_factor(this->get_index());
     float data_scale = _data->get_data_scale(this->get_index());

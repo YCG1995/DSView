@@ -28,6 +28,7 @@
 
 #include "trace.h"
 #include "view.h"
+#include "../log.h"
 #include "../sigsession.h"
 #include "../dsvdef.h"
 #include "../config/appconfig.h"
@@ -110,16 +111,21 @@ void Trace::set_name(QString name)
 int Trace::get_index()
 {
     if(_index_list.size() == 0){
-        assert(false);
+        // front() on an empty list is undefined behaviour and the returned
+        // value becomes a channel index in every caller.
+        dsv_warn("Trace::get_index(), trace \"%s\" has an empty index list.",
+                _name.toUtf8().constData());
+        return -1;
     }
-    
+
     return _index_list.front();
 }
 
 void Trace::set_index_list(const std::list<int> &index_list)
 {
     if (index_list.size() == 0){
-        assert(false);
+        dsv_err("Trace::set_index_list(), refusing an empty index list.");
+        return;
     }
 
     _index_list = index_list;

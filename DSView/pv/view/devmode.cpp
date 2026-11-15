@@ -128,6 +128,8 @@ void DevMode::set_device()
     {
         const sr_dev_mode *mode = (const sr_dev_mode *)l->data;
         auto *mode_name = get_mode_name(mode->mode);
+        if (mode_name == NULL)
+            continue;
         QString icon_name = QString::fromLocal8Bit(mode_name->_logo);
 
         QAction *action = new QAction(this);
@@ -185,7 +187,8 @@ void DevMode::paintEvent(QPaintEvent*)
 void DevMode::on_mode_change()
 {
     if (_device_agent->have_instance() == false){
-        assert(false);
+        dsv_err("DevMode::on_mode_change(), no device instance.");
+        return;
     }
     
     QAction *action = qobject_cast<QAction *>(sender());
@@ -211,6 +214,8 @@ void DevMode::on_mode_change()
             _session->switch_work_mode(mode);
 
             auto *mode_name = get_mode_name(mode);
+            if (mode_name == NULL)
+                break;
             QString icon_fname = iconPath + "/" + QString::fromLocal8Bit(mode_name->_logo);
             
             _mode_btn->setIcon(QIcon(icon_fname));
@@ -233,7 +238,8 @@ void DevMode::on_mode_change()
 void DevMode::on_close()
 {
    if (_device_agent->have_instance() == false){
-        assert(false);
+        dsv_err("DevMode::on_close(), no device instance.");
+        return;
     }
 
     if (_bFile && MsgBox::Confirm(L_S(STR_PAGE_MSG, S_ID(IDS_MSG_CLOSE_DEVICE), "Are you sure to close the device?"))){
@@ -272,7 +278,10 @@ const struct dev_mode_name* DevMode::get_mode_name(int mode)
         if (mode == o._mode){
             return &o;
     }
-    assert(false);
+    // A missing entry used to fall off the end of this non-void function; both
+    // callers then read ->_logo through a garbage pointer.
+    dsv_err("DevMode::get_mode_name(), unknown device mode %d.", mode);
+    return NULL;
 }
 
 void DevMode::UpdateLanguage()

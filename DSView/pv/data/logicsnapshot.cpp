@@ -176,8 +176,10 @@ void LogicSnapshot::first_payload(const sr_datafeed_logic &logic, uint64_t total
         }
 
         if (_ch_index.size() == 0){
-            dsv_info("ERROR: all channels disalbed");
-            assert(0);
+            // No channel is enabled: leave _ch_data empty and make the payload
+            // path refuse the frame instead of dividing by a zero channel count
+            // (_channel_num == 0) further down.
+            dsv_err("ERROR: all channels disabled");
         }
     }
     else {
@@ -223,6 +225,23 @@ void LogicSnapshot::append_cross_payload(const sr_datafeed_logic &logic)
     assert(logic.format == LA_CROSS_DATA);
     assert(logic.length >= ScaleSize * _channel_num);
     assert(logic.data);
+
+    if (_ch_data.empty() || _channel_num == 0){
+        // first_payload() left no channel (all probes disabled, or a reload
+        // changed the channel set while a frame was in flight). Every index and
+        // the per-sample modulo below divide by _channel_num.
+        dsv_err("ERROR:LogicSnapshot::append_cross_payload(), no channel table "
+                "(channels %u).", _channel_num);
+        _memory_failed = true;
+        return;
+    }
+    if (logic.data == NULL || logic.length < ScaleSize * _channel_num){
+        dsv_err("ERROR:LogicSnapshot::append_cross_payload(), malformed packet "
+                "(length %" G_GUINT64_FORMAT ", channels %u).",
+                (uint64_t)logic.length, _channel_num);
+        _memory_failed = true;
+        return;
+    }
 
     uint8_t *data_src_ptr = (uint8_t*)logic.data;
     uint64_t len = logic.length;
@@ -675,6 +694,14 @@ const uint8_t *LogicSnapshot::get_samples(uint64_t start_sample, uint64_t &end_s
     uint64_t index0 = logic_sample_index / LeafBlockSamples / RootScale;
     uint64_t index1 = (logic_sample_index / LeafBlockSamples) % RootScale;
     uint64_t offset = (start_sample % LeafBlockSamples) / 8;
+
+    // The old code indexed _ch_data[order] first and only checked order == -1
+    // afterwards, so a request for a channel that is not in this capture read
+    // in front of the vector before the guard could fire.
+    if (order < 0 || order >= (int)_ch_data.size()
+        || index0 >= _ch_data[order].size()){
+        return NULL;
+    }
 
     uint8_t *block_buffer = (uint8_t*)_ch_data[order][index0].lbp[index1];
 

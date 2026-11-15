@@ -747,13 +747,15 @@ void View::signals_changed(const Trace* eventTrace)
         const double height = (_time_viewport->height()
                                - 2 * actualMargin * label_size) * 1.0 / total_rows;
 
-        if (_device_agent->have_instance() == false){
-            assert(false);
-        }
-        
-        int mode = _device_agent->get_work_mode();
+        // No device instance means get_work_mode() has no handle to ask: fall
+        // back to the generic row height instead of dereferencing it.
+        const bool have_device = _device_agent->have_instance();
+        if (!have_device)
+            dsv_warn("View::update_layout(), no device instance.");
 
-        if (mode == LOGIC) {
+        int mode = have_device ? _device_agent->get_work_mode() : -1;
+
+        if (have_device && mode == LOGIC) {
             int v;
             bool ret;
 
@@ -771,7 +773,7 @@ void View::signals_changed(const Trace* eventTrace)
                 _signalHeight = (height >= max_height) ? max_height : height;
             }
         }
-        else if (_device_agent->get_work_mode() == DSO) {
+        else if (have_device && mode == DSO) {
             _signalHeight = (_header->height()
                              - horizontalScrollBar()->height()
                              - 2 * actualMargin * label_size) * 1.0 / total_rows;

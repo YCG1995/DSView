@@ -725,7 +725,10 @@ namespace pv
             double hori_res = -1;
 
             if (_session->get_device()->get_work_mode() != DSO){
-                assert(false);
+                // The knob only makes sense for the scope, but the handler can
+                // still arrive after the mode changed (queued wheel event).
+                dsv_warn("SamplingBar::hori_knob(), ignored outside DSO mode.");
+                return -1;
             }
 
             disconnect(&_sample_count, SIGNAL(currentIndexChanged(int)), this, SLOT(on_samplecount_sel(int)));

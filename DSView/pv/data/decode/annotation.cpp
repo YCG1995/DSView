@@ -28,6 +28,7 @@
 #include "annotation.h"
 #include "annotationrestable.h"
 #include <cstring>
+#include "../../log.h"
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
@@ -116,8 +117,12 @@ Annotation::~Annotation()
   
 const std::vector<QString>& Annotation::annotations() const
 {  
+	 static const std::vector<QString> empty_lines;
 	 AnnotationSourceItem *pobj = _status->m_resTable.GetItem(_resIndex);	 
-	 assert(pobj);
+	 if (pobj == NULL){
+         dsv_err("Annotation::annotations(), resource item %d is missing.", _resIndex);
+         return empty_lines;
+     }
 	
      AnnotationSourceItem &resItem = *pobj;
 
@@ -127,8 +132,13 @@ const std::vector<QString>& Annotation::annotations() const
      }
 
 	//resItem.str_number_hex must be not null
-	if (resItem.str_number_hex[0] == 0){
-		assert(false);
+	if (resItem.str_number_hex == NULL || resItem.str_number_hex[0] == 0){
+		// The numeric payload of this row could not be stored (or has not
+		// arrived yet); show the raw source text instead of dereferencing NULL
+		// and passing NULL into format_numberic().
+		dsv_warn("Annotation::annotations(), numeric payload of item %d is missing.",
+				_resIndex);
+		return resItem.src_lines;
 	}
  
 	 if (resItem.cur_display_format !=  _status->m_format){

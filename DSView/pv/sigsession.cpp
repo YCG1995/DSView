@@ -589,7 +589,7 @@ namespace pv
         if (_device_agent.have_instance() == false)
         {
             dsv_err("Error!No device selected");
-            assert(false);
+            return false;
         }
         if (_device_status == ST_RUNNING || _device_agent.is_collecting())
         {
@@ -982,7 +982,8 @@ namespace pv
     { 
         if (_device_agent.have_instance() == false)
         {
-            assert(false);
+            dsv_err("SigSession::init_signals(), no device instance.");
+            return;
         }
 
         std::vector<view::Signal *> sigs;
@@ -1082,7 +1083,8 @@ namespace pv
     {
         if (_device_agent.have_instance() == false)
         {
-            assert(false);
+            dsv_err("SigSession::reload(), no device instance.");
+            return;
         }
 
         if (_is_working)
@@ -1667,7 +1669,7 @@ namespace pv
         if (dec == NULL)
         {
             dsv_err("Decoder instance is null!");
-            assert(false);
+            return false;
         }
 
         out_trace = NULL;
@@ -1971,8 +1973,14 @@ namespace pv
     {
         ds_lock_guard lock(_data_mutex);
 
-        assert(dsoSig1);
-        assert(dsoSig2);
+        if (dsoSig1 == NULL || dsoSig2 == NULL)
+        {
+            // The math stack dereferences both signals on the very next call;
+            // refusing here is the only way to keep a half-configured math
+            // trace out of the view.
+            dsv_err("SigSession::math_rebuild(), math source channel is missing.");
+            return;
+        }
 
         DESTROY_OBJECT(_math_trace);
 
@@ -2498,12 +2506,11 @@ namespace pv
         }
         dsv_err("Decoder trace index out of range:%d (have %d)",
                 index, (int)_decode_traces.size());
-        assert(false);
         // Returning NULL instead of falling off the end of this non-void
-        // function: in a release build the assert above expands to nothing,
-        // and the garbage return value makes every caller's "trace is null"
-        // guard useless (an out-of-range trace_index from the MCP API crashed
-        // the app in DecodeTrace::decoder()).
+        // function: an assert here expands to nothing in a release build, and
+        // the garbage return value makes every caller's "trace is null" guard
+        // useless (an out-of-range trace_index from the MCP API crashed the app
+        // in DecodeTrace::decoder()).
         return NULL;
     }
 

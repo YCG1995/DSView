@@ -20,6 +20,7 @@
  */
 
 #include "calibration.h"
+#include "../log.h"
   
 #include <QGridLayout>
 #include <QFuture>
@@ -132,7 +133,8 @@ void Calibration::retranslateUi()
 void Calibration::BuildUI()
 {
     if (_device_agent->have_instance() == false){
-        assert(false);
+        dsv_err("Calibration::BuildUI(), no device instance.");
+        return;
     }
     assert(_params.empty());
 
@@ -192,7 +194,8 @@ void Calibration::BuildUI()
 void Calibration::update_device_info()
 { 
     if (_device_agent->have_instance() == false){
-        assert(false);
+        dsv_err("Calibration::update_device_info(), no device instance.");
+        return;
     }
 
     int dex = -1;

@@ -1746,7 +1746,7 @@ namespace pv
     {
         if (file == ""){
             dsv_err("File name is empty.");
-            assert(false);
+            return false;
         }
 
         _protocol_widget->del_all_protocol();
@@ -2262,7 +2262,7 @@ namespace pv
     {
         if (name == ""){
             dsv_err("Session file name is empty.");
-            assert(false);
+            return false;
         }
 
         std::string file_name = pv::path::ToUnicodePath(name);
@@ -2854,7 +2854,7 @@ namespace pv
 
         if (file == ""){
             dsv_err("File name is empty.");
-            assert(false);
+            return sessionDoc;
         }
 
         auto f_name = pv::path::ConvertPath(file);
@@ -2892,7 +2892,7 @@ namespace pv
 
         if (file == ""){
             dsv_err("File name is empty.");
-            assert(false);
+            return dec_array;
         }
 
         /* read "decoders" */

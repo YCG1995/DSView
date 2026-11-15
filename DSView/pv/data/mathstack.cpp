@@ -95,8 +95,10 @@ MathStack::MathStack(pv::SigSession *session,
     memset(_envelope_level, 0, sizeof(_envelope_level));
 
     if (dsoSig1 == NULL || dsoSig2 == NULL){
-        dsv_info("ERROR: MathStack::MathStack, dsoSig1 or dsoSig2 is null.");
-        assert(false);
+        // Every calculation below dereferences both channels; log loudly and
+        // let the callers' guards keep the trace disabled instead of relying on
+        // an assert that a release build compiles away.
+        dsv_err("MathStack::MathStack, dsoSig1 or dsoSig2 is null.");
     }
 }
 

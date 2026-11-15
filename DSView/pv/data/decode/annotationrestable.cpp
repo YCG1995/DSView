@@ -128,7 +128,9 @@ int AnnotationResTable::MakeIndex(const std::string &key, AnnotationSourceItem* 
 
 AnnotationSourceItem* AnnotationResTable::GetItem(int index){
     if (index < 0 || index >= (int)m_resourceTable.size()){
-        assert(false);
+        dsv_err("AnnotationResTable::GetItem(), index %d out of range (have %d).",
+                index, (int)m_resourceTable.size());
+        return NULL;
     }
     return m_resourceTable[index];
 }
@@ -169,9 +171,12 @@ const char* AnnotationResTable::format_to_string(const char *hex_str, int fmt)
 		 else if (c >= 'a' && c <= 'f'){
 			 dex = (int)(c - 'a') + 10;
 		 }
-		 else{ 
+         else{ 
 			 dsv_err("is not a hex string");
-			 assert(false);
+			 // dex stays at its previous value, and the table lookup below
+			 // uses it to index g_bin_cvt_table: stop instead of converting a
+			 // non-hex annotation into an out-of-bounds read.
+			 return data;
 		 }
 
          char *ptable = (char*)g_bin_cvt_table + dex * 4;

@@ -985,7 +985,7 @@ void DecoderStack::execute_decode_stack()
 
     if (session == NULL){
         dsv_err("Failed to call srd_session_new()");
-        assert(false);
+        return;
     }
     
     // Get the intial sample count. This must be the number of samples that are
@@ -1117,8 +1117,10 @@ void DecoderStack::annotation_callback(srd_proto_data *pdata, void *self)
         return;
     }
     if (d->_decoder_status == NULL){ 
+        // The annotation owns a pointer into this status object; creating one
+        // for a deleted stack dereferences NULL right afterwards.
         dsv_err("decode task was deleted.");
-        assert(false);
+        return;
     }
   
     if (d->_no_memory) {
@@ -1154,7 +1156,6 @@ void DecoderStack::annotation_callback(srd_proto_data *pdata, void *self)
     assert(row_iter != d->_rows.end());
     if (row_iter == d->_rows.end()) {
         dsv_err("Unexpected annotation: decoder = 0x%x, format = %d", (void*)decc, a->format());
-        assert(0);
         return;
     }
 

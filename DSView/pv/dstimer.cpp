@@ -20,6 +20,7 @@
  */
 
 #include "dstimer.h" 
+#include "log.h"
 #include <assert.h>
 
  
@@ -42,8 +43,13 @@ void DsTimer::TimeOut(int millsec, CALLBACL_FUNC f)
 
 void DsTimer::TimeOut(int millsec)
 {
+    // on_timeout() calls _call unconditionally. Scheduling a shot while the
+    // callback is still NULL means a null function pointer call inside the Qt
+    // event loop, which takes the whole process down instead of just skipping
+    // one timer tick.
     if (_call == NULL){
-        assert(false);
+        dsv_warn("DsTimer::TimeOut(), no callback installed.");
+        return;
     }
     QTimer::singleShot(millsec, this, SLOT(on_timeout()));
 }

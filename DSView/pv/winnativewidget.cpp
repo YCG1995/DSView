@@ -156,8 +156,8 @@ WinNativeWidget::WinNativeWidget(const int x, const int y, const int width,
     RegisterClassEx(&wcx);
     if (FAILED(RegisterClassEx(&wcx)))
     {
-        dsv_info("ERROR: can't register window class");
-        assert(false);
+        dsv_err("ERROR: can't register window class");
+        return;
     }
  
     _hWnd = CreateWindow(L"DSViewWindowClass", L"DSView",
@@ -168,8 +168,8 @@ WinNativeWidget::WinNativeWidget(const int x, const int y, const int width,
 
     if (!_hWnd)
     {
-        dsv_info("ERROR: can't create naitive window");
-        assert(false);
+        dsv_err("ERROR: can't create naitive window");
+        return;
     }
     
     SetWindowLongPtr(_hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));

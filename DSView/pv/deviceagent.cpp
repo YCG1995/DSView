@@ -317,14 +317,15 @@ GSList *DeviceAgent::get_channels()
  {
     assert(_dev_handle);
 
-    if (is_demo() == false){
-        assert(false);
-    }        
-    
     QString pattern_mode;
+    if (is_demo() == false){
+        dsv_err("DeviceAgent::get_demo_operation_mode(), device is not in demo mode.");
+        return pattern_mode;
+    }
+
     if(get_config_string(SR_CONF_PATTERN_MODE, pattern_mode) == false)
     {
-        assert(false);
+        dsv_err("DeviceAgent::get_demo_operation_mode(), pattern mode is unavailable.");
     }
     return pattern_mode;
  }

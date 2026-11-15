@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <assert.h>
 #include <math.h>
+#include "../log.h"
 #include "../ui/xspinbox.h"
 
 using boost::optional;
@@ -123,8 +124,11 @@ QWidget* Int::get_widget(QWidget *parent, bool auto_commit)
     }
     else
     {
-        // Unexpected value type.
-        assert(0);
+        // Unexpected value type: leave a defined value instead of reading an
+        // uninitialised int_val into the spin box.
+        dsv_err("Int::get_widget(), unsupported value type.");
+        int_val = 0;
+        range_min = 0, range_max = 0;
     }
 
     // @todo Sigrok supports 64-bit quantities, but Qt does not have a
@@ -178,11 +182,11 @@ void Int::commit()
         new_value = g_variant_new_uint64(_spin_box->value());
     else
     {
-        // Unexpected value type.
-        assert(0);
+        // Unexpected value type: new_value stays NULL, and the code below used
+        // to pass it to g_variant_ref/unref and then keep it as _value.
+        dsv_err("Int::commit(), unsupported value type.");
+        return;
     }
-
-    assert(new_value);
 
     g_variant_unref(_value);
     g_variant_ref(new_value);

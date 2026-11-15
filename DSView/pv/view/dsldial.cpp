@@ -168,7 +168,9 @@ uint64_t dslDial::get_max()
 uint64_t dslDial::get_value()
 {    
     if (_sel >= (uint64_t)_value.count()){
-        assert(false);
+        dsv_err("dslDial::get_value(), selection %llu out of range (have %d).",
+                (unsigned long long)_sel, _value.count());
+        return 0;
     }
 
     return _value[_sel];

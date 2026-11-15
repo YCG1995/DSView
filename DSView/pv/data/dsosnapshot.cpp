@@ -291,10 +291,20 @@ const uint8_t *DsoSnapshot::get_samples(int64_t start_sample, int64_t end_sample
 
     int order = get_ch_order(ch_index);
 
-    if (order == -1){
+    // assert(false) disappears in a release build, so this used to fall through
+    // to _ch_data[-1] and hand the caller a pointer built from whatever the
+    // heap holds in front of the vector.
+    if (order < 0 || order >= (int)_ch_data.size()){
         dsv_err("The channel index is not exist:%d", ch_index);
-        assert(false);
-    } 
+        return NULL;
+    }
+    if (start_sample < 0 || end_sample < start_sample
+        || (uint64_t)end_sample >= _sample_count){
+        dsv_err("DsoSnapshot::get_samples(), range %" G_GINT64_FORMAT "-%" G_GINT64_FORMAT
+                " is outside of %" G_GUINT64_FORMAT " samples.",
+                start_sample, end_sample, _sample_count);
+        return NULL;
+    }
 
     return (uint8_t*)_ch_data[order] + start_sample;
 }
@@ -525,7 +535,9 @@ bool DsoSnapshot::get_max_min_value(uint8_t &maxv, uint8_t &minv, int chan_index
     }
 
     if (chan_index < 0 || chan_index >= (int)_ch_data.size()){
-        assert(false);
+        dsv_err("DsoSnapshot::get_max_min_value(), channel %d out of range (have %d).",
+                chan_index, (int)_ch_data.size());
+        return false;
     }
 
     uint8_t *p = _ch_data[chan_index];
