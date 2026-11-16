@@ -28,7 +28,8 @@
 #include <boost/optional.hpp>
 #include <QObject>
 #include <QString>
-#include <mutex> 
+#include <mutex>
+#include <atomic> 
 
 #include "decode/row.h" 
 #include "../data/signaldata.h"
@@ -236,10 +237,19 @@ private:
     uint64_t        _sample_count; 
  
     decode_task_status  *_stask_stauts;    
+    // stop_decode_work() bumps this counter. A decode keeps the value it saw
+    // when it started and stops as soon as the counter moves, so a stop request
+    // that lands while do_decode_work() is still creating a fresh
+    // decode_task_status object (and therefore cannot set its _bStop field yet)
+    // is no longer lost - a lost stop made the caller's join() wait for the
+    // whole remaining decode, which is what froze the UI on long captures.
+    std::atomic<uint64_t> _stop_epoch;
+    uint64_t              _stop_epoch_base;
     mutable std::mutex _output_mutex; 
     bool            _is_capture_end;
     int             _progress;
     bool            _is_decoding;
+    bool            _null_block_logged;
     uint64_t        _result_count;
 
 	friend class DecoderStackTest::TwoDecoderStack;

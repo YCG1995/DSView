@@ -773,32 +773,37 @@ namespace pv
             }
 
             // Pick a buffer that is neither the current view buffer nor
-            // occupied by a background auto-save. With three buffers the
-            // next capture virtually always gets a free buffer.
+            // occupied by a background auto-save, nor still being read by a
+            // running decode. A decode keeps the snapshot pointer it started
+            // with, and that snapshot can stop being the view buffer while the
+            // decode is still running - clearing it then frees the blocks the
+            // decoder is reading (the "long 1PPS test" crash).
             int buf_index = -1;
             for(int tries=0; tries<40 && buf_index<0; tries++)
             {
                 for(int i=0; i<(int)_data_list.size(); i++){
-                    if (i != view_index && !_data_list[i]->is_saving()){
+                    if (i != view_index && !_data_list[i]->is_saving()
+                        && !_data_list[i]->get_logic()->decode_held()){
                         buf_index = i;
                         break;
                     }
                 }
 
                 if (buf_index < 0){
-                    // All non-view buffers are being saved: wait briefly for
-                    // one to finish instead of dropping a frame.
+                    // All non-view buffers are being saved or decoded: wait
+                    // briefly for one to finish instead of dropping a frame.
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             }
 
             if (buf_index < 0){
-                // Every candidate is being written by a background save right
-                // now. Clearing one of those would corrupt the file that is
-                // being generated (and free memory the writer is reading), so
-                // drop this frame instead and let the caller retry.
+                // Every candidate is being written by a background save (or is
+                // still owned by a decoder) right now. Clearing one of those
+                // would corrupt the file that is being generated (and free
+                // memory the writer is reading), so drop this frame instead
+                // and let the caller retry.
                 dsv_err("start_capture: all %d candidate buffer(s) are being "
-                    "saved, refusing to clear one of them",
+                    "saved or decoded, refusing to clear one of them",
                     (int)_data_list.size() - 1);
                 return false;
             }
@@ -2088,16 +2093,30 @@ namespace pv
     // append a decode task, and try create a thread
     void SigSession::add_decode_task(view::DecodeTrace *trace)
     {
-        std::lock_guard<std::mutex> lock(_decode_task_mutex);
-        _decode_tasks.push_back(trace);
+        {
+            std::lock_guard<std::mutex> lock(_decode_task_mutex);
+            _decode_tasks.push_back(trace);
 
-        if (!_is_decoding){
-            if (_decode_thread.joinable())
-                _decode_thread.join();
-
-            _decode_thread = std::thread(&SigSession::decode_task_proc, this);
-            _is_decoding = true;
+            // The worker sets this flag under the same mutex right before it
+            // quits, so a false here means the queued task really has no
+            // thread left to run it.
+            if (_is_decoding)
+                return;
         }
+
+        // Reap the finished thread and start a new one. The join must not run
+        // while _decode_task_mutex is held: the worker takes that mutex in
+        // get_top_decode_task(), so joining underneath it would deadlock.
+        std::lock_guard<std::mutex> thread_lock(_decode_thread_mutex);
+
+        if (_is_decoding)
+            return;
+
+        if (_decode_thread.joinable())
+            _decode_thread.join();
+
+        _is_decoding = true;
+        _decode_thread = std::thread(&SigSession::decode_task_proc, this);
     }
 
     void SigSession::remove_decode_task(view::DecodeTrace *trace)
@@ -2210,8 +2229,11 @@ namespace pv
         }
         for (auto trace : _decode_traces)
             trace->decoder()->stop_decode_work();
-        if (_decode_thread.joinable())
-            _decode_thread.join();
+        {
+            std::lock_guard<std::mutex> thread_lock(_decode_thread_mutex);
+            if (_decode_thread.joinable())
+                _decode_thread.join();
+        }
 
 
         // Re-import the changed packages one at a time, and attach every decoder
@@ -2494,8 +2516,11 @@ namespace pv
         }
 
         // Wait the thread end.
-        if (_decode_thread.joinable())
-            _decode_thread.join();
+        {
+            std::lock_guard<std::mutex> thread_lock(_decode_thread_mutex);
+            if (_decode_thread.joinable())
+                _decode_thread.join();
+        }
     }
 
     view::DecodeTrace *SigSession::get_decoder_trace(int index)
@@ -2560,7 +2585,13 @@ namespace pv
         _view_data->get_logic()->decode_end();
 
         dsv_info("------->decode thread end");
-        _is_decoding = false;        
+        {
+            // Broadcast "the worker is gone" under the queue mutex, so
+            // add_decode_task() cannot decide to reuse a thread that is about
+            // to die and leave its task queued forever.
+            std::lock_guard<std::mutex> lock(_decode_task_mutex);
+            _is_decoding = false;
+        }
     }
 
     Snapshot *SigSession::get_signal_snapshot()

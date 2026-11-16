@@ -143,8 +143,24 @@ public:
     void free_decode_lpb(void *lbp);
 
     inline bool is_able_free(){
-        return _able_free;
+        return _able_free && !_decode_hold;
     } 
+
+    /**
+     * A running decoder holds raw pointers into the leaf blocks of this
+     * snapshot (get_samples() hands them to srd, which reads them after the
+     * snapshot lock has been released). While that is the case no block of
+     * this snapshot may be freed: capture_ended()/calc_mipmap(isEnd=true) has
+     * to defer them to _free_block_list, and the decoder frees the deferred
+     * ones itself through free_decode_lpb(). The flag is a hold that
+     * first_payload() cannot clear, so a capture that starts while a decode
+     * is running cannot pull the blocks out from under it.
+     */
+    void hold_for_decode(bool on);
+
+    inline bool decode_held(){
+        return _decode_hold;
+    }
 
     inline uint64_t get_loop_offset(){
         return _loop_offset;
@@ -258,6 +274,9 @@ private:
     bool        _is_loop;
     volatile uint64_t   _loop_offset;
     bool        _able_free;
+    // Set while a decoder is reading this snapshot's blocks. Not cleared by
+    // first_payload(); see hold_for_decode().
+    bool        _decode_hold;
     std::vector<void*> _free_block_list;
     struct BlockIndex _cur_ref_block_indexs[CHANNEL_MAX_COUNT];
     int         _lst_free_block_index;

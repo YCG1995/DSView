@@ -65,10 +65,13 @@ DecoderStack::DecoderStack(pv::SigSession *session,
     _mark_index = -1;
     _decoder_status = decoder_status;
     _stask_stauts = NULL; 
+    _stop_epoch = 0;
+    _stop_epoch_base = 0;
     _is_capture_end = true;
     _snapshot = NULL;
     _progress = 0;
     _is_decoding = false;
+    _null_block_logged = false;
     _result_count = 0;
     
     _stack.push_back(new decode::Decoder(dec));
@@ -382,6 +385,8 @@ void DecoderStack::init()
     _no_memory = false;
     _snapshot = NULL;
     _result_count = 0;
+    _null_block_logged = false;
+    _is_decoding = false;
 
     for (auto i = _rows.begin();i != _rows.end(); i++) { 
         (*i).second->clear();
@@ -392,6 +397,10 @@ void DecoderStack::init()
  
 void DecoderStack::stop_decode_work()
 {  
+    // Persistent stop marker: it also covers the window in which do_decode_work()
+    // has not yet installed its own decode_task_status (see _stop_epoch).
+    ++_stop_epoch;
+
     //set the flag to exit from task thread 
      if (_stask_stauts){
          _stask_stauts->_bStop = true;
@@ -533,6 +542,11 @@ bool DecoderStack::ensure_required_probes()
 
 void DecoderStack::do_decode_work()
 {
+    // Any stop request from here on is seen by decode_data() through this
+    // snapshot of the counter, even if it arrives before _stask_stauts below
+    // exists.
+    _stop_epoch_base = _stop_epoch.load();
+
     //set the flag to exit from task thread 
      if (_stask_stauts){
          _stask_stauts->_bStop = true;
@@ -682,7 +696,42 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
         }
     }
 
-    assert(logic_di);
+    // assert() is compiled out in release builds, and this pointer is
+    // dereferenced a few lines below (logic_di->dec_num_channels).
+    if (logic_di == NULL) {
+        _error_message = QString("解码器栈中没有需要通道的解码实例，无法解码。");
+        dsv_err("ERROR: decode stack has no channel-reading decoder instance");
+        _progress = 100;
+        _is_decoding = false;
+        return;
+    }
+
+    // lbp_array below is a fixed 35-entry array; srd can hand out more channels
+    // for a stack of stacked decoders than that.
+    const int kMaxDecodeChannels = 35;
+    if (logic_di->dec_num_channels > kMaxDecodeChannels) {
+        _error_message = QString("解码器请求的通道数 %1 超过上限 %2。")
+                .arg(logic_di->dec_num_channels).arg(kMaxDecodeChannels);
+        dsv_err("ERROR: decoder wants %d channels, at most %d are supported",
+                logic_di->dec_num_channels, kMaxDecodeChannels);
+        _progress = 100;
+        _is_decoding = false;
+        return;
+    }
+
+    // While this loop runs, srd reads the leaf blocks of the snapshot through
+    // the pointers returned by get_samples(). Nothing may free those blocks in
+    // the meantime - in particular not capture_ended() of a capture that starts
+    // while a decode is still running, which is exactly the "long test" case.
+    struct SnapshotHold {
+        data::LogicSnapshot *s;
+        SnapshotHold(data::LogicSnapshot *snap) : s(snap) {
+            if (s) s->hold_for_decode(true);
+        }
+        ~SnapshotHold() {
+            if (s) s->hold_for_decode(false);
+        }
+    } snapshot_hold(_snapshot);
 
     uint64_t i = decode_start;
     char *error = NULL; 
@@ -699,6 +748,7 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
     bool bCheckEnd = false;
     uint64_t end_index = decode_end;
     uint64_t decoded_sample_count = 0;
+    const uint64_t stop_epoch = _stop_epoch_base;
 
     _progress = 0;
     _is_decoding = true;
@@ -709,7 +759,8 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
         lbp_array[j] = NULL;
     }
 
-    while(i <= end_index && !_no_memory && !status->_bStop)
+    while(i <= end_index && !_no_memory && !status->_bStop
+          && _stop_epoch.load() == stop_epoch)
     {
         chunk.clear();
         chunk_const.clear();
@@ -724,9 +775,11 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
                 // A capture in progress has not delivered its first frame yet.
                 // Wait for it instead of silently dropping the decode: the task
                 // runs once per capture/file and nothing would re-trigger it.
-                if (status->_bStop || ++wait_loops > 50) {
+                if (status->_bStop || _stop_epoch.load() != stop_epoch || ++wait_loops > 50) {
                     dsv_info("Have no data to decode (waited %d ms).",
                             wait_loops * 200);
+                    _is_decoding = false;
+                    _progress = 100;
                     return;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -769,6 +822,15 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
                 if (_snapshot->has_data(sig_index)) {
                     const uint8_t *data_ptr = _snapshot->get_samples(i, chunk_end, sig_index, &lbp);
                     bool flag = _snapshot->get_sample(i, sig_index);
+                    // A sparse frame can have the block released already; srd
+                    // then falls back to the constant level for this channel,
+                    // which is the correct behaviour for "no data here".
+                    if (data_ptr == NULL && !_null_block_logged) {
+                        _null_block_logged = true;
+                        dsv_info("decode: channel %d has no block at sample %llu "
+                                "(sparse frame, srd uses the channel level)",
+                                sig_index, (unsigned long long)i);
+                    }
                     chunk.push_back(data_ptr);
                     chunk_const.push_back(flag);
 
@@ -803,6 +865,8 @@ void DecoderStack::decode_data(const uint64_t decode_start, const uint64_t decod
                     }
                     srd_console_write(qPrintable(msg + (any ? "\n" : "（无）\n")));
                     dsv_err("%s", qPrintable(msg));
+                    _is_decoding = false;
+                    _progress = 100;
                     return;
                 }
             }

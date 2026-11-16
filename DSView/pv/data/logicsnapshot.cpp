@@ -59,6 +59,7 @@ LogicSnapshot::LogicSnapshot() :
     _is_loop = false;
     _loop_offset = 0;
     _able_free = true;
+    _decode_hold = false;
     _is_search_stop = false;
 }
 
@@ -106,11 +107,21 @@ void LogicSnapshot::init_all()
     _last_ended = true;
     _loop_offset = 0;
     _able_free = true;
+    _decode_hold = false;
 }
 
 void LogicSnapshot::clear()
 {
     std::lock_guard<std::mutex> lock(_mutex);
+
+    // A decoder is still walking the leaf blocks of this snapshot right now;
+    // free_data() would pull the memory out from under it. The capture path
+    // picks another buffer in that case, so refusing here is only a safety net.
+    if (_decode_hold) {
+        dsv_err("LogicSnapshot::clear() refused: a decoder still holds this snapshot");
+        return;
+    }
+
     free_data();
     init_all();
 
@@ -663,7 +674,7 @@ void LogicSnapshot::calc_mipmap(unsigned int order, uint8_t index0, uint8_t inde
         uint64_t ref_root = _cur_ref_block_indexs[order].root_index;
         uint64_t ref_lbp  = _cur_ref_block_indexs[order].lbp_index;
 
-        if (_able_free || index0 > ref_root || (index0 == ref_root && index1 > ref_lbp))
+        if ((_able_free && !_decode_hold) || index0 > ref_root || (index0 == ref_root && index1 > ref_lbp))
             free(_ch_data[order][index0].lbp[index1]);
         else
             _free_block_list.push_back(_ch_data[order][index0].lbp[index1]);
@@ -773,8 +784,12 @@ bool LogicSnapshot::get_sample_unlock(uint64_t index, int sig_index)
 bool LogicSnapshot::get_sample_self(uint64_t index, int sig_index)
 {
     int order = get_ch_order(sig_index);
-    assert(order != -1);
-    assert(_ch_data[order].size() != 0);
+
+    // Release builds have no asserts: an unknown channel used to index
+    // _ch_data[-1] here, and a leaf block that had already been freed (sparse
+    // frame end, head blocks in loop mode) was dereferenced as NULL + offset.
+    if (order < 0 || order >= (int)_ch_data.size() || _ch_data[order].empty())
+        return false;
 
     if (index < _ring_sample_count) {
         uint64_t index_mask = 1ULL << (index & LevelMask[0]);
@@ -782,11 +797,16 @@ bool LogicSnapshot::get_sample_self(uint64_t index, int sig_index)
         uint64_t index1 = (index & RootMask) >> LeafBlockPower;
         uint64_t root_pos_mask = 1ULL << index1;
 
+        if (index0 >= _ch_data[order].size())
+            return false;
+
         if ((_ch_data[order][index0].tog & root_pos_mask) == 0) {
             return (_ch_data[order][index0].first & root_pos_mask) != 0;
         }
         else {
             uint64_t *lbp = (uint64_t*)_ch_data[order][index0].lbp[index1];
+            if (lbp == NULL)
+                return false;
             return *(lbp + ((index & LeafMask) >> ScalePower)) & index_mask;
         }
     }
@@ -1623,6 +1643,19 @@ void LogicSnapshot::move_first_node_to_last()
 
         _ch_data[i].push_back(rn);                        
     }
+}
+
+void LogicSnapshot::hold_for_decode(bool on)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (_decode_hold == on)
+        return;
+
+    _decode_hold = on;
+    dsv_info("snapshot decode hold: %s (blocks %d, deferred frees %d)",
+            on ? "on" : "off", (int)_ch_data.size(),
+            (int)_free_block_list.size());
 }
 
 void LogicSnapshot::decode_end()

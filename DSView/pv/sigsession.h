@@ -632,8 +632,12 @@ private:
     mutable std::mutex      _sampling_mutex;
     mutable std::mutex      _data_mutex;
     mutable std::mutex      _decode_task_mutex;  
+    // Serialises start/join of _decode_thread. It must never be held together
+    // with _decode_task_mutex: the worker thread takes that one inside
+    // get_top_decode_task(), so joining while holding it can never complete.
+    mutable std::mutex      _decode_thread_mutex;
     std::thread             _decode_thread;
-    volatile bool           _is_decoding;
+    std::atomic<bool>       _is_decoding;
  
 	std::vector<view::Signal*>      _signals; 
     std::vector<view::DecodeTrace*> _decode_traces;
