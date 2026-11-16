@@ -482,6 +482,13 @@ void PpsConfigDlg::build_time_options()
 				values.append(v);
 		}
 	}
+	// Non-decimal presets: the 40 ms / 80 ms bursts the user asked for. They are
+	// still filtered by max_ms, so a rate/channel combination whose buffer cannot
+	// hold such a window simply does not offer them.
+	for (double v : {40.0, 80.0}) {
+		if (v <= max_ms)
+			values.append(v);
+	}
 	if (values.isEmpty())
 		values.append(max_ms);
 
