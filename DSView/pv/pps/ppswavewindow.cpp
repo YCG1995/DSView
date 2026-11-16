@@ -76,12 +76,14 @@ static QColor channelColor(int i)
 }
 
 // Values are nanoseconds; switch unit when the magnitude gets large so the
-// axis labels stay readable instead of showing 2304240.
+// axis labels stay readable instead of showing 2304240. The decimals are chosen
+// so switching unit never costs resolution: 1 ns is 0.001 us and 0.000001 ms,
+// so a value read in us keeps 3 decimals and one read in ms keeps 6.
 static QString fmtNs(double v)
 {
 	const double a = std::fabs(v);
 	if (a >= 1e6)
-		return QString::number(v / 1e6, 'f', 3) + QString::fromUtf8(" ms");
+		return QString::number(v / 1e6, 'f', 6) + QString::fromUtf8(" ms");
 	if (a >= 1e3)
 		return QString::number(v / 1e3, 'f', 3) + QString::fromUtf8(" \u03bcs");
 	if (a >= 1.0)
@@ -89,30 +91,43 @@ static QString fmtNs(double v)
 	return QString::number(v, 'f', 3) + " ns";
 }
 
-// Tick label for an axis spanning `span` units of v. Fixed 3 decimals is not
+// Tick label for an axis spanning `span` units of v. A fixed 3 decimals is not
 // enough when the whole band covers e.g. 1.2799..1.2801 ms: every tick then
 // prints as the same "1.280 ms", which looks exactly like a broken axis.
+// The axis must never show less than the ns the measurement resolves, so the
+// decimals are fixed by the unit instead of following the tick spacing: 6
+// decimals of a ms (0.000001 ms) and 3 of a us (0.001 us) are exactly 1 ns, and
+// a ns label keeps one decimal. A coarser tick spacing then prints trailing
+// zeros ("1.280000 ms") rather than silently dropping digits, which is what
+// made neighbouring 1 ns ticks collapse into the same label.
 static QString fmtTick(double v, double span)
 {
+	Q_UNUSED(span);
 	const double a = std::fabs(v);
 	const double u = (a >= 1e6) ? 1e6 : (a >= 1e3 ? 1e3 : 1.0);
 	const QString suffix = (u == 1e6) ? QString::fromUtf8(" ms")
 		: (u == 1e3 ? QString::fromUtf8(" \u03bcs") : QString(" ns"));
-	const double s = std::fabs(span) / u;
-	int dec = 3;
-	if (s > 0.0 && s < 1.0) {
-		dec = (int)std::ceil(-std::log10(s / 4.0));
-		if (dec < 1)
-			dec = 1;
-		// Cap at 4: the label has to fit the 60-odd pixels of the left gutter,
-		// and a number longer than the gutter reads as a truncated number.
-		if (dec > 4)
-			dec = 4;
-	}
+	const int dec = (u == 1e6) ? 6 : (u == 1e3 ? 3 : 1);
 	return QString::number(v / u, 'f', dec) + suffix;
 }
 
-static void niceTicks(double lo, double hi, int target, QVector<double> &out)
+// Axis labels live in the left gutter; clip them to their own rect so a label
+// that ever outgrows the gutter is cut at the gutter edge instead of painting
+// over the channel tags inside the plot area.
+static void draw_gutter_label(QPainter &p, const QRectF &rect, const QString &text)
+{
+	p.save();
+	p.setClipRect(rect);
+	p.drawText(rect, Qt::AlignRight | Qt::AlignVCenter, text);
+	p.restore();
+}
+
+// `min_step` is the finest tick spacing the labels can still tell apart: 1 ns,
+// which is exactly the last digit of a us label with 3 decimals and of a ms
+// label with 6. Without that floor a 1 ns spread asks for 0.2 ns steps, and
+// three neighbouring ticks then print as the same "76.900 us".
+static void niceTicks(double lo, double hi, int target, QVector<double> &out,
+		double min_step = 1.0)
 {
 	out.clear();
 	if (!(hi > lo) || target < 2)
@@ -127,6 +142,8 @@ static void niceTicks(double lo, double hi, int target, QVector<double> &out)
 		step = mag * 5.0;
 	else if (raw / mag > 1.0)
 		step = mag * 2.0;
+	if (min_step > 0.0 && step < min_step)
+		step = min_step;
 	const double first = std::ceil(lo / step) * step;
 	for (double v = first; v <= hi + step * 1e-9; v += step)
 		out.append(v);
@@ -426,13 +443,16 @@ double PpsWaveCanvas::timeSpan() const
 
 QRectF PpsWaveCanvas::plotRect() const
 {
-	// Every mode has its own Y scale and prints tick labels in the left gutter,
-	// so the gutter has to hold "2.400 ms"-style text in all of them.
-	int left = 76;
-	if (_mode == SharedOverlay)
-		left = 92;   // room for "2.400 ms"-style labels
-	else if (_mode == Grid)
-		left = 84;
+	// Every mode has its own Y scale and prints tick labels in the left gutter.
+	// The labels carry full nanosecond resolution now, and the widest one the
+	// axis can print is a negative millisecond value with six decimals
+	// ("-512.088123 ms"), so the gutter is measured from that instead of a
+	// fixed number that only fitted the old three-decimal format.
+	QFont label_font = font();
+	label_font.setPointSizeF(8.0);
+	const QFontMetricsF fm(label_font);
+	const double worst = fm.horizontalAdvance(QString::fromUtf8("-512.088123 ms"));
+	int left = std::max(76, (int)std::ceil(worst) + 24);
 	const int top = 10;
 	const int right = 16;
 	const int bottom = 56;   // two staggered label rows + the axis caption
@@ -1320,11 +1340,20 @@ void PpsWaveCanvas::paintStacked(QPainter &p, const QRectF &r)
 				p.drawLine(QPointF(band.left(), y), QPointF(band.right(), y));
 			}
 			p.setPen(QPen(tl));
+			// Bands in this mode are short, so a label placed exactly on a band edge
+			// used to spill into the band above (or into the channel tag). Keep every
+			// label inside its own band, and drop one that would touch the previous.
+			double last_label_y = -1e9;
 			for (int i = 0; i < yticks.size(); ++i) {
 				const double y = inner_bottom - (yticks[i] - lo) / (hi - lo)
 					* (inner_bottom - inner_top);
-				p.drawText(QRectF(2, y - 8, band.left() - 6, 16),
-						Qt::AlignRight | Qt::AlignVCenter, fmtTick(yticks[i], hi - lo));
+				const double ty = std::max(band.top() + 18.0,
+						std::min(inner_bottom - 8.0, y));
+				if (ty - last_label_y < 11.0)
+					continue;
+				last_label_y = ty;
+				draw_gutter_label(p, QRectF(2, ty - 8, band.left() - 6, 16),
+						fmtTick(yticks[i], hi - lo));
 			}
 		}
 
@@ -1433,8 +1462,8 @@ void PpsWaveCanvas::paintShared(QPainter &p, const QRectF &r)
 		const double y = r.bottom() - (yticks[i] - lo) / (hi - lo) * r.height();
 		p.setPen(QPen(ink));
 		p.drawLine(QPointF(r.left() - 4, y), QPointF(r.left(), y));
-		p.drawText(QRectF(2, y - 8, r.left() - 8, 16),
-				Qt::AlignRight | Qt::AlignVCenter, fmtTick(yticks[i], hi - lo));
+		draw_gutter_label(p, QRectF(2, y - 8, r.left() - 8, 16),
+				fmtTick(yticks[i], hi - lo));
 	}
 
 	// Curves.
@@ -1552,8 +1581,8 @@ void PpsWaveCanvas::paintGrid(QPainter &p, const QRectF &r)
 			for (int i = 0; i < yticks.size(); ++i) {
 				const double y = inner_bottom - (yticks[i] - lo) / (hi - lo)
 					* inner_h;
-				p.drawText(QRectF(2, y - 7, row.left() - 6, 14),
-						Qt::AlignRight | Qt::AlignVCenter, fmtTick(yticks[i], hi - lo));
+				draw_gutter_label(p, QRectF(2, y - 7, row.left() - 6, 14),
+						fmtTick(yticks[i], hi - lo));
 			}
 		}
 
