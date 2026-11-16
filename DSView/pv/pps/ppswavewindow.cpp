@@ -452,7 +452,7 @@ QRectF PpsWaveCanvas::plotRect() const
 	label_font.setPointSizeF(8.0);
 	const QFontMetricsF fm(label_font);
 	const double worst = fm.horizontalAdvance(QString::fromUtf8("-512.088123 ms"));
-	int left = std::max(76, (int)std::ceil(worst) + 24);
+	int left = std::max(64, (int)std::ceil(worst) + 12);
 	const int top = 10;
 	const int right = 16;
 	const int bottom = 56;   // two staggered label rows + the axis caption
@@ -1578,10 +1578,19 @@ void PpsWaveCanvas::paintGrid(QPainter &p, const QRectF &r)
 				p.drawLine(QPointF(row.left(), y), QPointF(row.right(), y));
 			}
 			p.setPen(QPen(tl));
+			// The channel tag sits at the top of the gutter, so the first tick
+			// label starts below it; a label that would touch the one above is
+			// dropped instead of printed on top of it.
+			double last_label_y = row.top() + 15.0;
 			for (int i = 0; i < yticks.size(); ++i) {
 				const double y = inner_bottom - (yticks[i] - lo) / (hi - lo)
 					* inner_h;
-				draw_gutter_label(p, QRectF(2, y - 7, row.left() - 6, 14),
+				const double ty = std::max(row.top() + 18.0,
+						std::min(inner_bottom - 7.0, y));
+				if (inner_bottom - row.top() < 30.0 || ty - last_label_y < 11.0)
+					continue;
+				last_label_y = ty;
+				draw_gutter_label(p, QRectF(2, ty - 7, row.left() - 6, 14),
 						fmtTick(yticks[i], hi - lo));
 			}
 		}
