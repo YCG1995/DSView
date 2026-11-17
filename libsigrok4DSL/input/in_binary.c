@@ -109,7 +109,7 @@ static int loadfile(struct sr_input *in, const char *filename)
 	ctx = in->internal;
     packet.status = SR_PKT_OK;
 
-	if ((fd = open(filename, O_RDONLY)) == -1)
+	if ((fd = sr_open_path_ro(filename)) == -1)
 		return SR_ERR;
 
 	num_probes = g_slist_length(in->sdi->channels);

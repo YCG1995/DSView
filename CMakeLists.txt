@@ -543,6 +543,7 @@ DSView/pv/winshadow.h
 #-------------------------------------------------------------------------------
 set(libsigrok4DSL_SOURCES
     libsigrok4DSL/version.c
+    libsigrok4DSL/pathutil.c
     libsigrok4DSL/strutil.c
     libsigrok4DSL/std.c
     libsigrok4DSL/session_driver.c

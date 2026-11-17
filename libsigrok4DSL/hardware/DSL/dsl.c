@@ -336,9 +336,22 @@ static int hw_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi)
     }
 
     if (sdi->status == SR_ST_ACTIVE) {
-        /* Device is already in use. */
-        sr_detail("The usb device is opened, handle:%p", usb->usb_dev);
-        return SR_OK;
+        /*
+         * The instance claims the device is already open, but the device may
+         * have been unplugged and replugged since then: the cached handle is
+         * then a dead one and every command on it fails with LIBUSB_ERROR_IO.
+         * Probe the handle before trusting it, and reopen when it is stale.
+         */
+        int cfg = 0;
+        if (libusb_get_configuration(usb->devhdl, &cfg) == LIBUSB_SUCCESS) {
+            sr_detail("The usb device is opened, handle:%p", usb->usb_dev);
+            return SR_OK;
+        }
+
+        sr_warn("hw_dev_open(), the cached usb handle is stale, reopening.");
+        libusb_close(usb->devhdl);
+        usb->devhdl = NULL;
+        sdi->status = SR_ST_INACTIVE;
     }
 
     if (sdi->status == SR_ST_INITIALIZING) {
@@ -1324,22 +1337,20 @@ SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filena
     struct ctl_wr_cmd wr_cmd;
     struct ctl_rd_cmd rd_cmd;
     uint8_t rd_cmd_data;
-	struct stat f_stat;
 
     sr_info("Configure FPGA using \"%s\"", filename);
-    if ((fw = fopen(filename, "rb")) == NULL) {
+    if ((fw = sr_fopen_path(filename, "rb")) == NULL) {
         sr_err("Unable to open FPGA bit file %s for reading: %s",
                filename, strerror(errno));
         ds_set_last_error(SR_ERR_FIRMWARE_NOT_EXIST);
         return SR_ERR;
     }
-	
-    if (stat(filename, &f_stat) == -1){
+
+    if (sr_file_size(filename, &filesize) != SR_OK) {
+        sr_err("Unable to stat FPGA bit file %s.", filename);
         fclose(fw);
         return SR_ERR;
     }
-
-    filesize = (uint64_t)f_stat.st_size;
 
     if ((buf = g_try_malloc0(filesize)) == NULL) {
         sr_err("FPGA configure buf malloc failed.");
@@ -1906,6 +1917,7 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
         sr_err("%s:%d, Failed to get hardware information.",
             __func__, __LINE__);
         ds_set_last_error(SR_ERR_DEVICE_USB_IO_ERROR);
+        dsl_dev_close(sdi);
         return SR_ERR;
     }
     *fpga_done = (hw_info & bmFPGA_DONE) != 0;
@@ -1940,6 +1952,7 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
                 sr_err("%s:%d, Configure FPGA failed!",
                     __func__, __LINE__);
                 ds_set_last_error(SR_ERR_DEVICE_USB_IO_ERROR);
+                dsl_dev_close(sdi);
                 return SR_ERR;
             }
         }
@@ -1952,7 +1965,7 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
                sr_err("%s:%d, Failed to get FPGA bin version!",
                         __func__, __LINE__);
                ds_set_last_error(SR_ERR_DEVICE_USB_IO_ERROR);
-               sdi->status = SR_ST_INACTIVE;
+               dsl_dev_close(sdi);
                return SR_ERR;
             }
 
@@ -1960,6 +1973,7 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
                sr_err("%s: HDL verison incompatible! device:%02X, target:%02X", __func__, 
                             hw_info, DSL_HDL_VERSION);
                ds_set_last_error(SR_ERR_DEVICE_FIRMWARE_VERSION_LOW);
+               dsl_dev_close(sdi);
                sdi->status = SR_ST_INCOMPATIBLE;
                return SR_ERR;
             }
@@ -1973,6 +1987,7 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
         sr_err("%s:%d, Read EEPROM content failed!",
             __func__, __LINE__);
         ds_set_last_error(SR_ERR_DEVICE_USB_IO_ERROR);
+        dsl_dev_close(sdi);
         return SR_ERR;
     }
 

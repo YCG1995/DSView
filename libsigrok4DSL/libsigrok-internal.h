@@ -63,6 +63,11 @@ enum device_transaction_types
 	DEV_TRANS_OPEN = 1
 };
 
+/** path helpers that accept both UTF-8 and ANSI encoded paths (pathutil.c) */
+SR_PRIV FILE *sr_fopen_path(const char *path, const char *mode);
+SR_PRIV int sr_file_size(const char *path, uint64_t *size);
+SR_PRIV int sr_open_path_ro(const char *path);
+
 /** global variable */
 extern char DS_RES_PATH[500];
 extern struct ds_trigger *trigger;

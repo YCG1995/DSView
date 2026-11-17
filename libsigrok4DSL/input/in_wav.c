@@ -41,20 +41,21 @@ struct context {
 
 static int get_wav_header(const char *filename, char *buf)
 {
-	struct stat st;
 	int fd, l;
+
+	uint64_t st_size;
 
 	l = strlen(filename);
 	if (l <= 4 || strcasecmp(filename + l - 4, ".wav"))
 		return SR_ERR;
 
-	if (stat(filename, &st) == -1)
+	if (sr_file_size(filename, &st_size) != SR_OK)
 		return SR_ERR;
-	if (st.st_size <= 45)
+	if (st_size <= 45)
 		/* Minimum size of header + 1 8-bit mono PCM sample. */
 		return SR_ERR;
 
-	if ((fd = open(filename, O_RDONLY)) == -1)
+	if ((fd = sr_open_path_ro(filename)) == -1)
 		return SR_ERR;
 
 	l = read(fd, buf, 40);
@@ -155,7 +156,7 @@ static int loadfile(struct sr_input *in, const char *filename)
 	ds_data_forward(in->sdi, &packet);
 	sr_config_free(src);
 
-	if ((fd = open(filename, O_RDONLY)) == -1)
+	if ((fd = sr_open_path_ro(filename)) == -1)
 		return SR_ERR;
 
 	lseek(fd, 40, SEEK_SET);
