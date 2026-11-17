@@ -1461,6 +1461,116 @@ static int receive_data(int fd, int revents, const struct sr_dev_inst *sdi)
     return TRUE;
 }
 
+/*
+ * The WinUSB backend used on Windows delivers no libusb hotplug event when the
+ * cable is pulled, so lib_main never runs its "detach -> reconnect -> reopen"
+ * flow. The instance therefore keeps a dead libusb_device/handle after a
+ * replug, and the next "start" fails with LIBUSB_ERROR_IO on a closed handle
+ * until the user switches to another device and back.
+ *
+ * Bind the instance to the device that is actually present now, so the caller
+ * can just reopen it.
+ */
+static int rebind_usb_device(struct sr_dev_inst *sdi)
+{
+    struct sr_usb_dev_inst *usb = sdi->conn;
+    struct DSL_context *devc = sdi->priv;
+    struct drv_context *drvc = di->priv;
+    libusb_device **devlist = NULL;
+    ssize_t cnt, i;
+    int found = 0;
+
+    cnt = libusb_get_device_list(drvc->sr_ctx->libusb_ctx, &devlist);
+    if (cnt < 0) {
+        sr_err("%s: Failed to call libusb_get_device_list(): %s.",
+               __func__, libusb_error_name((int)cnt));
+        return SR_ERR;
+    }
+
+    for (i = 0; i < cnt; i++) {
+        struct libusb_device_descriptor des;
+
+        if (libusb_get_device_descriptor(devlist[i], &des) != LIBUSB_SUCCESS)
+            continue;
+
+        if (des.idVendor != devc->profile->vid ||
+            des.idProduct != devc->profile->pid)
+            continue;
+
+        /* Hold a reference: the list itself is released below. */
+        usb->usb_dev = libusb_ref_device(devlist[i]);
+        usb->bus = libusb_get_bus_number(devlist[i]);
+        usb->address = libusb_get_device_address(devlist[i]);
+        found = 1;
+        break;
+    }
+
+    libusb_free_device_list(devlist, 1);
+
+    if (!found) {
+        sr_warn("%s: no %04x:%04x device is present, cannot rebind.",
+                __func__, devc->profile->vid, devc->profile->pid);
+        return SR_ERR;
+    }
+
+    sr_info("%s: rebound to the device present now, bus %d address %d.",
+            __func__, usb->bus, usb->address);
+    return SR_OK;
+}
+
+/*
+ * Ask the hardware whether it is still there. libusb_get_configuration() is
+ * useless for this on the WinUSB backend: it answers from a cached
+ * bConfigurationValue and happily succeeds on a handle whose device is gone.
+ * A vendor read really goes over the bus, and reading the hardware status
+ * register has no side effect.
+ */
+static int usb_handle_is_alive(struct sr_usb_dev_inst *usb)
+{
+    struct ctl_rd_cmd rd_cmd;
+    uint8_t hw_info = 0;
+
+    if (usb->devhdl == NULL)
+        return FALSE;
+
+    rd_cmd.header.dest = DSL_CTL_HW_STATUS;
+    rd_cmd.header.size = 1;
+    rd_cmd.data = &hw_info;
+
+    return command_ctl_rd(usb->devhdl, rd_cmd) == SR_OK;
+}
+
+/*
+ * Make sure the instance can actually talk to the hardware. Returns SR_OK when
+ * the device is alive and open, SR_ERR when it cannot be recovered.
+ */
+static int dsl_ensure_device_alive(struct sr_dev_inst *sdi)
+{
+    struct sr_usb_dev_inst *usb = sdi->conn;
+
+    if (sdi->status != SR_ST_ACTIVE || usb->devhdl == NULL)
+        return SR_ERR;
+
+    if (usb_handle_is_alive(usb))
+        return SR_OK;
+
+    sr_warn("%s: the cached usb handle is dead (device replugged?), reopening.",
+            __func__);
+
+    dev_close(sdi);
+
+    if (rebind_usb_device(sdi) != SR_OK)
+        return SR_ERR;
+
+    if (dev_open(sdi) != SR_OK) {
+        sr_err("%s: reopening the device failed.", __func__);
+        return SR_ERR;
+    }
+
+    sr_info("%s: the device is reopened and usable again.", __func__);
+    return SR_OK;
+}
+
 static int dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 {
     (void)cb_data;
@@ -1481,6 +1591,18 @@ static int dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
     drvc = di->priv;
     devc = sdi->priv;
     usb = sdi->conn;
+
+    /*
+     * A replug leaves a dead handle behind (no hotplug event arrives on
+     * Windows). Recover here instead of failing every later start with
+     * LIBUSB_ERROR_IO until the user switches device by hand.
+     */
+    if (dsl_ensure_device_alive(sdi) != SR_OK) {
+        sr_err("%s: the device is not usable, reopen it before collecting.",
+               __func__);
+        ds_set_last_error(SR_ERR_DEVICE_USB_IO_ERROR);
+        return SR_ERR;
+    }
 
     //devc->cb_data = cb_data;
     devc->cb_data = sdi;
@@ -1542,9 +1664,21 @@ static int dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
     wr_cmd.header.size = 0;
     
     if ((ret = command_ctl_wr(usb->devhdl, wr_cmd)) != SR_OK) {
-        sr_err("%s: Stop DSLogic acquisition failed!", __func__);
-        return ret;
-    } 
+        /*
+         * The handle can also die between the liveness check and this command.
+         */
+        if (dsl_ensure_device_alive(sdi) == SR_OK) {
+            usb = sdi->conn;
+            if ((ret = command_ctl_wr(usb->devhdl, wr_cmd)) == SR_OK) {
+                sr_info("%s: Stop Previous DSLogic acquisition!", __func__);
+            }
+        }
+
+        if (ret != SR_OK) {
+            sr_err("%s: Stop DSLogic acquisition failed!", __func__);
+            return ret;
+        }
+    }
     else {
         sr_info("%s: Stop Previous DSLogic acquisition!", __func__);
     }

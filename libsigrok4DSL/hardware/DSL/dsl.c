@@ -340,10 +340,17 @@ static int hw_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi)
          * The instance claims the device is already open, but the device may
          * have been unplugged and replugged since then: the cached handle is
          * then a dead one and every command on it fails with LIBUSB_ERROR_IO.
-         * Probe the handle before trusting it, and reopen when it is stale.
+         * libusb_get_configuration() cannot detect that (on WinUSB it answers
+         * from a cached value), so ask the hardware with a real vendor read.
          */
-        int cfg = 0;
-        if (libusb_get_configuration(usb->devhdl, &cfg) == LIBUSB_SUCCESS) {
+        struct ctl_rd_cmd probe_cmd;
+        uint8_t probe_info = 0;
+
+        probe_cmd.header.dest = DSL_CTL_HW_STATUS;
+        probe_cmd.header.size = 1;
+        probe_cmd.data = &probe_info;
+
+        if (usb->devhdl != NULL && command_ctl_rd(usb->devhdl, probe_cmd) == SR_OK) {
             sr_detail("The usb device is opened, handle:%p", usb->usb_dev);
             return SR_OK;
         }
